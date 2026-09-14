@@ -1,0 +1,32 @@
+src:
+  host: 192.168.1.3
+  port: 3306
+  database: test
+  username: root
+  password: 11111
+dest:
+  host: 192.168.1.200
+  port: 5432
+  database: test
+  username: test
+  password: 11111
+pageSize: 100000
+maxParallel: 30
+charInLength: false
+useNvarchar2: false
+Distributed: false
+tables:
+  test1:
+    - select * from test1
+  test2:
+    - select * from test2
+exclude:
+  - 'log1'
+  - 'log2'
+  - '*_cswysk'
+# 视图定义中跨 schema 引用的映射规则（可选）
+# key   = MySQL 中的源 schema 名（小写）
+# value = PostgreSQL 中的目标 schema 名；为空字符串则删除该前缀
+schemaMapping:
+  schema_b: ""
+  legacy_db: public
