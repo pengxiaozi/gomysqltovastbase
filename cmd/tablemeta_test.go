@@ -56,6 +56,46 @@ func TestQuoteDefault(t *testing.T) {
 	}
 }
 
+// TestQuoteLiteral 覆盖注释文本转 PostgreSQL 字符串字面量。
+// 注释内容来自 MySQL 元数据，是任意文本，转义出错会截断整条 COMMENT ON 语句。
+func TestQuoteLiteral(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain text", "用户名", "'用户名'"},
+		{"ascii", "user name", "'user name'"},
+		{"empty", "", "''"},
+
+		// 单引号必须双写，否则会提前闭合字面量
+		{"single quote", "it's", "'it''s'"},
+		{"only quote", "'", "''''"},
+		{"sql injection attempt", "x'; drop table t; --", "'x''; drop table t; --'"},
+
+		// 双引号在单引号字面量里无需转义
+		{"double quote", `say "hi"`, `'say "hi"'`},
+
+		// standard_conforming_strings=on 时反斜杠无特殊含义，原样保留
+		{"backslash", `C:\path\to`, `'C:\path\to'`},
+
+		// 换行是合法字符，直接保留
+		{"newline", "line1\nline2", "'line1\nline2'"},
+
+		// NUL 字节 PostgreSQL 文本类型不接受，必须剔除
+		{"nul byte removed", "a\x00b", "'ab'"},
+		{"only nul", "\x00", "''"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := quoteLiteral(tt.in); got != tt.want {
+				t.Errorf("quoteLiteral(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestIsTimeType 时间类型判定。两类调用方传入的大小写不同，
 // 且判定结果同时决定「默认值是否丢弃」「not null 是否放宽」两件事。
 func TestIsTimeType(t *testing.T) {

@@ -8,6 +8,7 @@ LOG_DIR="${1:-log}"
 
 FAIL_LOGS=(
     "tableCreateFailed.log"
+    "commentFailed.log"
     "seqCreateFailed.log"
     "idxCreateFailed.log"
     "DistributedAlterFailed.log"

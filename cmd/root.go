@@ -374,9 +374,11 @@ func preMigData(tableName string, sqlFullSplit []string) (dbCol []string, dbColT
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	// 循环遍历列名,把列名全部转为小写
+	// 循环遍历列名，保留原始大小写。
+	// pq.CopyIn 会给每个列名加双引号，一旦这里改变大小写，就会与建表时的列名
+	// 对不上，COPY 直接报 column does not exist，混合大小写的列尤其明显。
 	for i, value := range columns {
-		dbCol = append(dbCol, strings.ToLower(value)) //由于CopyIn方法每个列都会使用双引号包围，这里把列名全部转为小写(pg库默认都是小写的列名)，这样即便加上双引号也能正确查询到列
+		dbCol = append(dbCol, value)
 		dbColType = append(dbColType, strings.ToUpper(colType[i].DatabaseTypeName()))
 	}
 	return dbCol, dbColType, tableNotExist
@@ -431,7 +433,11 @@ func prepareSqlStr(tableName string, pageSize int) (sqlList []string) {
 	// 以下生成分页查询语句
 	for i := 0; i <= totalPageNum; i++ { // 使用小于等于，包含没有行数据的表
 		sqlStr = "SELECT t.* FROM (SELECT " + buffer1.String() + " FROM " + "`" + tableName + "`" + " ORDER BY " + buffer1.String() + " LIMIT " + strconv.Itoa(i*pageSize) + "," + strconv.Itoa(pageSize) + ") temp LEFT JOIN " + "`" + tableName + "`" + " t ON " + buffer2.String() + ";"
-		sqlList = append(sqlList, strings.ToLower(sqlStr))
+		// 不对语句做整体小写转换：这条 SQL 是发给 MySQL 的，
+		// 表名在大小写敏感的 MySQL(Linux 默认 lower_case_table_names=0) 上会查不到，
+		// 且无主键分支(root.go 上面的全表扫描)本就不做转换，两个分支行为应一致。
+		// 主键列名由上面的主键查询统一小写，MySQL 列名本身不区分大小写，无影响。
+		sqlList = append(sqlList, sqlStr)
 	}
 	return sqlList
 }

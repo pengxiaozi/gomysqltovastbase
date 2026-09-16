@@ -8,6 +8,7 @@ param(
 
 $FailLogs = @(
     "tableCreateFailed.log"
+    "commentFailed.log"
     "seqCreateFailed.log"
     "idxCreateFailed.log"
     "DistributedAlterFailed.log"

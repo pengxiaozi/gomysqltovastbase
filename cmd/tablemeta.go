@@ -98,6 +98,17 @@ func quoteDefault(dataType, def string) string {
 	}
 }
 
+// quoteLiteral 把文本转成 PostgreSQL 的字符串字面量。
+// 注释内容来自 MySQL 元数据，可能含单引号或换行，必须双写单引号后再内联——
+// COMMENT ON 属于工具语句，不支持绑定参数，只能拼字符串。
+// 同时去掉 NUL 字节：PostgreSQL 的文本类型不接受 \x00，带上会整条语句报错。
+// 该写法假定目标库 standard_conforming_strings 为 on(PostgreSQL 9.1 起的默认值，
+// 也是 SQL 标准行为)，此时反斜杠在普通字面量里没有转义含义，无需处理。
+func quoteLiteral(s string) string {
+	s = strings.ReplaceAll(s, "\x00", "")
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
 func (tb *Table) TableCreate(logDir string, tblName string, ch chan struct{}) {
 	defer wg2.Done()
 	var newTable Table
@@ -111,8 +122,18 @@ func (tb *Table) TableCreate(logDir string, tblName string, ch chan struct{}) {
 	if err != nil {
 		log.Error(err)
 	}
+	// 查询表注释。PostgreSQL 不支持在 create table 里内联注释(那是 MySQL 语法)，
+	// 只能等表建好之后用独立的 COMMENT ON TABLE 语句设置。
+	var tableComment string
+	if err := srcDb.QueryRow("select ifnull(table_comment,'') from information_schema.TABLES where table_schema=database() and table_name=?", tblName).Scan(&tableComment); err != nil {
+		log.Error("query table comment failed ", tblName, " ", err)
+	}
+	// 收集列注释，等建表成功后统一执行
+	var commentSqls []string
 	// 查询MySQL表结构
-	sql := fmt.Sprintf("select concat('\"',lower(column_name),'\"'),data_type,ifnull(character_maximum_length,'null'),is_nullable,case  column_default when '( \\'user\\' )' then 'user' else ifnull(column_default,'null') end as column_default,ifnull(numeric_precision,'null'),ifnull(numeric_scale,'null'),ifnull(datetime_precision,'null'),ifnull(column_key,'null'),ifnull(column_comment,'null'),ORDINAL_POSITION from information_schema.COLUMNS where table_schema=database() and table_name='%s' order by ORDINAL_POSITION", tblName)
+	// 列名保留原始大小写：索引/外键/序列的 DDL 都直接用 information_schema 的
+	// COLUMN_NAME 拼装，这里若做小写化会与之不一致，混合大小写的列会报 column does not exist
+	sql := fmt.Sprintf("select concat('\"',column_name,'\"'),data_type,ifnull(character_maximum_length,'null'),is_nullable,case  column_default when '( \\'user\\' )' then 'user' else ifnull(column_default,'null') end as column_default,ifnull(numeric_precision,'null'),ifnull(numeric_scale,'null'),ifnull(datetime_precision,'null'),ifnull(column_key,'null'),ifnull(column_comment,'null'),ORDINAL_POSITION from information_schema.COLUMNS where table_schema=database() and table_name='%s' order by ORDINAL_POSITION", tblName)
 	//fmt.Println(sql)
 	rows, err := srcDb.Query(sql)
 	if err != nil {
@@ -194,6 +215,11 @@ func (tb *Table) TableCreate(logDir string, tblName string, ch chan struct{}) {
 		if newTable.ordinalPosition == colTotal {
 			pgCreateTbl = pgCreateTbl[:len(pgCreateTbl)-1] + ")" // 最后一个列字段结尾去掉逗号,并且加上语句的右括号
 		}
+		// 收集列注释：空串表示没写注释，'null' 是查询里 ifnull 的哨兵值，两者都跳过。
+		// newTable.columnName 已由查询拼好双引号，可直接作为限定列名使用。
+		if cm := strings.TrimSpace(newTable.columnComment); cm != "" && cm != "null" {
+			commentSqls = append(commentSqls, "comment on column "+fmt.Sprintf("\"")+tblName+fmt.Sprintf("\"")+"."+newTable.columnName+" is "+quoteLiteral(cm))
+		}
 	}
 	//fmt.Println(pgCreateTbl) // 打印创建表语句
 	// 创建前先删除目标表
@@ -207,6 +233,22 @@ func (tb *Table) TableCreate(logDir string, tblName string, ch chan struct{}) {
 		log.Error("table ", tblName, " create failed  ", err)
 		LogError(logDir, "tableCreateFailed", pgCreateTbl, err)
 		failedCount += 1
+	} else {
+		// 表建好之后才能挂注释，所以放在这里而不是并进建表语句。
+		// 注释失败不影响表和数据的迁移，因此只记日志，不计入建表失败数。
+		if tc := strings.TrimSpace(tableComment); tc != "" {
+			cs := "comment on table " + fmt.Sprintf("\"") + tblName + fmt.Sprintf("\"") + " is " + quoteLiteral(tc)
+			if _, err = destDb.Exec(cs); err != nil {
+				log.Error("comment on table ", tblName, " failed ", err)
+				LogError(logDir, "commentFailed", cs, err)
+			}
+		}
+		for _, cs := range commentSqls {
+			if _, err = destDb.Exec(cs); err != nil {
+				log.Error("comment on column ", tblName, " failed ", err)
+				LogError(logDir, "commentFailed", cs, err)
+			}
+		}
 	}
 	<-ch
 }
@@ -217,7 +259,7 @@ func (tb *Table) SeqCreate(logDir string) (result []string) {
 	failedCount := 0
 	var tableName string
 	// 查询MySQL自增列信息，批量生成创建序列sql
-	sql := fmt.Sprintf("select table_name,COLUMN_NAME,Auto_increment,lower(concat('drop sequence if exists ','seq_',TABLE_NAME,'_',COLUMN_NAME,';')) drop_seq,lower(concat('create sequence ','seq_',TABLE_NAME,'_',COLUMN_NAME,' INCREMENT BY 1 START ',Auto_increment,';')) create_seq, lower(concat('alter table ',table_name,' alter column ',COLUMN_NAME, ' set default nextval(', '''' ,'seq_',TABLE_NAME,'_',COLUMN_NAME,  '''',');')) alter_default  from (select Auto_increment,column_name,a.table_name from (select TABLE_NAME, Auto_increment,case when Auto_increment  is not null then 'auto_increment' else '0' end ai from information_schema. TABLES where TABLE_SCHEMA =database() and  AUTO_INCREMENT is not null) a join (select table_name,COLUMN_NAME,EXTRA from information_schema. COLUMNS where TABLE_SCHEMA =database() and table_name in(select t.TABLE_NAME from information_schema. TABLES t where TABLE_SCHEMA =database() and AUTO_INCREMENT is not null)  and EXTRA='auto_increment' ) b on a.ai = b.EXTRA and a.table_name =b.table_name) aaa;")
+	sql := fmt.Sprintf("select table_name,COLUMN_NAME,Auto_increment,lower(concat('drop sequence if exists ','seq_',TABLE_NAME,'_',COLUMN_NAME,';')) drop_seq,lower(concat('create sequence ','seq_',TABLE_NAME,'_',COLUMN_NAME,' INCREMENT BY 1 START ',Auto_increment,';')) create_seq, concat('alter table \"',table_name,'\" alter column \"',COLUMN_NAME, '\" set default nextval(', '''' ,'seq_',lower(TABLE_NAME),'_',lower(COLUMN_NAME),  '''',');') alter_default  from (select Auto_increment,column_name,a.table_name from (select TABLE_NAME, Auto_increment,case when Auto_increment  is not null then 'auto_increment' else '0' end ai from information_schema. TABLES where TABLE_SCHEMA =database() and  AUTO_INCREMENT is not null) a join (select table_name,COLUMN_NAME,EXTRA from information_schema. COLUMNS where TABLE_SCHEMA =database() and table_name in(select t.TABLE_NAME from information_schema. TABLES t where TABLE_SCHEMA =database() and AUTO_INCREMENT is not null)  and EXTRA='auto_increment' ) b on a.ai = b.EXTRA and a.table_name =b.table_name) aaa;")
 	//fmt.Println(sql)
 	rows, err := srcDb.Query(sql)
 	if err != nil {
@@ -270,9 +312,9 @@ func (tb *Table) IdxCreate(logDir string, excludeTable []string) (result []strin
 			}
 
 		}
-		sql = fmt.Sprintf("SELECT IF ( INDEX_NAME = 'PRIMARY', CONCAT( 'ALTER TABLE \"', TABLE_NAME, '\" ', 'ADD ', IF ( NON_UNIQUE = 1, CASE UPPER( INDEX_TYPE ) WHEN 'FULLTEXT' THEN 'FULLTEXT INDEX' WHEN 'SPATIAL' THEN 'SPATIAL INDEX' ELSE CONCAT( 'INDEX ', INDEX_NAME, '' ) END, IF ( UPPER( INDEX_NAME ) = 'PRIMARY', CONCAT( 'PRIMARY KEY ' ), CONCAT( 'UNIQUE INDEX ', INDEX_NAME ) ) ), '(', GROUP_CONCAT( DISTINCT CONCAT( '', COLUMN_NAME, '' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ), ');' ), IF ( UPPER( INDEX_NAME ) != 'PRIMARY' AND non_unique = 0,CONCAT( 'CREATE UNIQUE INDEX ', index_name, '_', substr( uuid(), 1, 8 ), substr( MD5( RAND()), 1, 3 ), ' ON \"', table_name, '\"(', GROUP_CONCAT( DISTINCT CONCAT( '', COLUMN_NAME, '' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ), ');' ),REPLACE ( REPLACE ( CONCAT( 'CREATE INDEX ', index_name, '_', substr( uuid(), 1, 8 ), substr( MD5( RAND()), 1, 3 ), ' ON ', IF ( NON_UNIQUE = 1, CASE UPPER( INDEX_TYPE ) WHEN 'FULLTEXT' THEN 'FULLTEXT INDEX' WHEN 'SPATIAL' THEN 'SPATIAL INDEX' ELSE CONCAT( ' \"', table_name, '\"' ) END, IF ( UPPER( INDEX_NAME ) = 'PRIMARY', CONCAT( 'PRIMARY KEY ' ), CONCAT( table_name, ' xxx' ) ) ), '(', GROUP_CONCAT( DISTINCT CONCAT( '', COLUMN_NAME, '' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ), ');' ), CHAR ( 13 ), '' ), CHAR ( 10 ), '' ) ) ) sql_text,INDEX_NAME,concat('alter table \"',table_name,'\"',' DISTRIBUTE BY hash ','(',GROUP_CONCAT( DISTINCT CONCAT( '', COLUMN_NAME, '' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ),');') FROM information_schema.STATISTICS WHERE TABLE_SCHEMA IN ( SELECT DATABASE()) %s GROUP BY TABLE_NAME, INDEX_NAME ORDER BY TABLE_NAME ASC, INDEX_NAME ASC;", excludeSql)
+		sql = fmt.Sprintf("SELECT IF ( INDEX_NAME = 'PRIMARY', CONCAT( 'ALTER TABLE \"', TABLE_NAME, '\" ', 'ADD ', IF ( NON_UNIQUE = 1, CASE UPPER( INDEX_TYPE ) WHEN 'FULLTEXT' THEN 'FULLTEXT INDEX' WHEN 'SPATIAL' THEN 'SPATIAL INDEX' ELSE CONCAT( 'INDEX ', INDEX_NAME, '' ) END, IF ( UPPER( INDEX_NAME ) = 'PRIMARY', CONCAT( 'PRIMARY KEY ' ), CONCAT( 'UNIQUE INDEX ', INDEX_NAME ) ) ), '(', GROUP_CONCAT( DISTINCT CONCAT( '\"', COLUMN_NAME, '\"' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ), ');' ), IF ( UPPER( INDEX_NAME ) != 'PRIMARY' AND non_unique = 0,CONCAT( 'CREATE UNIQUE INDEX ', index_name, '_', substr( uuid(), 1, 8 ), substr( MD5( RAND()), 1, 3 ), ' ON \"', table_name, '\"(', GROUP_CONCAT( DISTINCT CONCAT( '\"', COLUMN_NAME, '\"' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ), ');' ),REPLACE ( REPLACE ( CONCAT( 'CREATE INDEX ', index_name, '_', substr( uuid(), 1, 8 ), substr( MD5( RAND()), 1, 3 ), ' ON ', IF ( NON_UNIQUE = 1, CASE UPPER( INDEX_TYPE ) WHEN 'FULLTEXT' THEN 'FULLTEXT INDEX' WHEN 'SPATIAL' THEN 'SPATIAL INDEX' ELSE CONCAT( ' \"', table_name, '\"' ) END, IF ( UPPER( INDEX_NAME ) = 'PRIMARY', CONCAT( 'PRIMARY KEY ' ), CONCAT( table_name, ' xxx' ) ) ), '(', GROUP_CONCAT( DISTINCT CONCAT( '\"', COLUMN_NAME, '\"' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ), ');' ), CHAR ( 13 ), '' ), CHAR ( 10 ), '' ) ) ) sql_text,INDEX_NAME,concat('alter table \"',table_name,'\"',' DISTRIBUTE BY hash ','(',GROUP_CONCAT( DISTINCT CONCAT( '\"', COLUMN_NAME, '\"' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ),');') FROM information_schema.STATISTICS WHERE TABLE_SCHEMA IN ( SELECT DATABASE()) %s GROUP BY TABLE_NAME, INDEX_NAME ORDER BY TABLE_NAME ASC, INDEX_NAME ASC;", excludeSql)
 	} else {
-		sql = fmt.Sprintf("SELECT IF ( INDEX_NAME = 'PRIMARY', CONCAT( 'ALTER TABLE \"', TABLE_NAME, '\" ', 'ADD ', IF ( NON_UNIQUE = 1, CASE UPPER( INDEX_TYPE ) WHEN 'FULLTEXT' THEN 'FULLTEXT INDEX' WHEN 'SPATIAL' THEN 'SPATIAL INDEX' ELSE CONCAT( 'INDEX ', INDEX_NAME, '' ) END, IF ( UPPER( INDEX_NAME ) = 'PRIMARY', CONCAT( 'PRIMARY KEY ' ), CONCAT( 'UNIQUE INDEX ', INDEX_NAME ) ) ), '(', GROUP_CONCAT( DISTINCT CONCAT( '', COLUMN_NAME, '' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ), ');' ), IF ( UPPER( INDEX_NAME ) != 'PRIMARY' AND non_unique = 0,CONCAT( 'CREATE UNIQUE INDEX ', index_name, '_', substr( uuid(), 1, 8 ), substr( MD5( RAND()), 1, 3 ), ' ON \"', table_name, '\"(', GROUP_CONCAT( DISTINCT CONCAT( '', COLUMN_NAME, '' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ), ');' ),REPLACE ( REPLACE ( CONCAT( 'CREATE INDEX ', index_name, '_', substr( uuid(), 1, 8 ), substr( MD5( RAND()), 1, 3 ), ' ON ', IF ( NON_UNIQUE = 1, CASE UPPER( INDEX_TYPE ) WHEN 'FULLTEXT' THEN 'FULLTEXT INDEX' WHEN 'SPATIAL' THEN 'SPATIAL INDEX' ELSE CONCAT( ' \"', table_name, '\"' ) END, IF ( UPPER( INDEX_NAME ) = 'PRIMARY', CONCAT( 'PRIMARY KEY ' ), CONCAT( table_name, ' xxx' ) ) ), '(', GROUP_CONCAT( DISTINCT CONCAT( '', COLUMN_NAME, '' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ), ');' ), CHAR ( 13 ), '' ), CHAR ( 10 ), '' ) ) ) sql_text,INDEX_NAME,concat('alter table \"',table_name,'\"',' DISTRIBUTE BY hash ','(',GROUP_CONCAT( DISTINCT CONCAT( '', COLUMN_NAME, '' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ),');') FROM information_schema.STATISTICS WHERE TABLE_SCHEMA IN ( SELECT DATABASE()) GROUP BY TABLE_NAME, INDEX_NAME ORDER BY TABLE_NAME ASC, INDEX_NAME ASC;")
+		sql = fmt.Sprintf("SELECT IF ( INDEX_NAME = 'PRIMARY', CONCAT( 'ALTER TABLE \"', TABLE_NAME, '\" ', 'ADD ', IF ( NON_UNIQUE = 1, CASE UPPER( INDEX_TYPE ) WHEN 'FULLTEXT' THEN 'FULLTEXT INDEX' WHEN 'SPATIAL' THEN 'SPATIAL INDEX' ELSE CONCAT( 'INDEX ', INDEX_NAME, '' ) END, IF ( UPPER( INDEX_NAME ) = 'PRIMARY', CONCAT( 'PRIMARY KEY ' ), CONCAT( 'UNIQUE INDEX ', INDEX_NAME ) ) ), '(', GROUP_CONCAT( DISTINCT CONCAT( '\"', COLUMN_NAME, '\"' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ), ');' ), IF ( UPPER( INDEX_NAME ) != 'PRIMARY' AND non_unique = 0,CONCAT( 'CREATE UNIQUE INDEX ', index_name, '_', substr( uuid(), 1, 8 ), substr( MD5( RAND()), 1, 3 ), ' ON \"', table_name, '\"(', GROUP_CONCAT( DISTINCT CONCAT( '\"', COLUMN_NAME, '\"' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ), ');' ),REPLACE ( REPLACE ( CONCAT( 'CREATE INDEX ', index_name, '_', substr( uuid(), 1, 8 ), substr( MD5( RAND()), 1, 3 ), ' ON ', IF ( NON_UNIQUE = 1, CASE UPPER( INDEX_TYPE ) WHEN 'FULLTEXT' THEN 'FULLTEXT INDEX' WHEN 'SPATIAL' THEN 'SPATIAL INDEX' ELSE CONCAT( ' \"', table_name, '\"' ) END, IF ( UPPER( INDEX_NAME ) = 'PRIMARY', CONCAT( 'PRIMARY KEY ' ), CONCAT( table_name, ' xxx' ) ) ), '(', GROUP_CONCAT( DISTINCT CONCAT( '\"', COLUMN_NAME, '\"' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ), ');' ), CHAR ( 13 ), '' ), CHAR ( 10 ), '' ) ) ) sql_text,INDEX_NAME,concat('alter table \"',table_name,'\"',' DISTRIBUTE BY hash ','(',GROUP_CONCAT( DISTINCT CONCAT( '\"', COLUMN_NAME, '\"' ) ORDER BY SEQ_IN_INDEX ASC SEPARATOR ', ' ),');') FROM information_schema.STATISTICS WHERE TABLE_SCHEMA IN ( SELECT DATABASE()) GROUP BY TABLE_NAME, INDEX_NAME ORDER BY TABLE_NAME ASC, INDEX_NAME ASC;")
 	}
 	// 查询MySQL索引、主键、唯一约束等信息，批量生成创建语句
 	fmt.Println("create index: ", sql)
@@ -333,7 +375,7 @@ func (tb *Table) FKCreate(logDir string) (result []string) {
 		if err := rows.Scan(&fkTable); err != nil {
 			log.Error(err)
 		}
-		sql = fmt.Sprintf("SELECT ifnull(concat('ALTER TABLE \"',K.TABLE_NAME,'\" ADD CONSTRAINT ',K.CONSTRAINT_NAME,' FOREIGN KEY(',GROUP_CONCAT(COLUMN_NAME),')',' REFERENCES \"',K.REFERENCED_TABLE_NAME,'\"(',GROUP_CONCAT(REFERENCED_COLUMN_NAME),')',' ON DELETE ',DELETE_RULE,' ON UPDATE ',UPDATE_RULE),'null') FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE k INNER JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS r on k.CONSTRAINT_NAME = r.CONSTRAINT_NAME where k.CONSTRAINT_SCHEMA =database() AND r.CONSTRAINT_SCHEMA=database()  and k.REFERENCED_TABLE_NAME is not null and k.table_name='%s'  order by k.ORDINAL_POSITION;", fkTable)
+		sql = fmt.Sprintf("SELECT ifnull(concat('ALTER TABLE \"',K.TABLE_NAME,'\" ADD CONSTRAINT ',K.CONSTRAINT_NAME,' FOREIGN KEY(',GROUP_CONCAT(CONCAT('\"',COLUMN_NAME,'\"')),')',' REFERENCES \"',K.REFERENCED_TABLE_NAME,'\"(',GROUP_CONCAT(CONCAT('\"',REFERENCED_COLUMN_NAME,'\"')),')',' ON DELETE ',DELETE_RULE,' ON UPDATE ',UPDATE_RULE),'null') FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE k INNER JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS r on k.CONSTRAINT_NAME = r.CONSTRAINT_NAME where k.CONSTRAINT_SCHEMA =database() AND r.CONSTRAINT_SCHEMA=database()  and k.REFERENCED_TABLE_NAME is not null and k.table_name='%s'  order by k.ORDINAL_POSITION;", fkTable)
 		err := srcDb.QueryRow(sql).Scan(&createSql) // 根据单个表获取外键拼接sql
 		if err != nil {
 			log.Error(err)
