@@ -2,7 +2,99 @@ package cmd
 
 import (
 	"testing"
+
+	"github.com/spf13/viper"
 )
+
+// TestApplyCaseToDDL 覆盖 identifierCase 配置对标识符大小写的转换。
+// 关键边界：只转换双引号内的标识符，单引号字符串字面量必须原样保留，
+// 否则 nextval('seq_x_y') 会和 create sequence 生成的名字对不上。
+func TestApplyCaseToDDL(t *testing.T) {
+	const src = `create table "Sys_User"("userName" int)`
+	const seq = `alter table "Sys_User" alter column "userID" set default nextval('seq_Sys_User_userID')`
+
+	tests := []struct {
+		name string
+		mode string
+		in   string
+		want string
+	}{
+		// 默认 preserve：原样返回
+		{"preserve keeps case", "preserve", src, `create table "Sys_User"("userName" int)`},
+		{"empty defaults to preserve", "", src, `create table "Sys_User"("userName" int)`},
+		{"unknown value defaults to preserve", "Keep", src, `create table "Sys_User"("userName" int)`},
+
+		{"lower", "lower", src, `create table "sys_user"("username" int)`},
+		{"lower is case-insensitive config", "LOWER", src, `create table "sys_user"("username" int)`},
+		{"upper", "upper", src, `create table "SYS_USER"("USERNAME" int)`},
+
+		// 单引号字面量不是标识符，不能被转换
+		{
+			name: "single-quoted literal untouched",
+			mode: "lower",
+			in:   seq,
+			want: `alter table "sys_user" alter column "userid" set default nextval('seq_Sys_User_userID')`,
+		},
+
+		// 未加引号的标识符(索引名/约束名)不处理，交给 PostgreSQL 折叠
+		{
+			name: "unquoted index name untouched",
+			mode: "lower",
+			in:   `create index IDX_NAME on "Sys_User"("userName")`,
+			want: `create index IDX_NAME on "sys_user"("username")`,
+		},
+
+		// 引号外的关键字不处理
+		{
+			name: "keywords untouched",
+			mode: "lower",
+			in:   `ALTER TABLE "Sys_User" ADD PRIMARY KEY ("userName")`,
+			want: `ALTER TABLE "sys_user" ADD PRIMARY KEY ("username")`,
+		},
+
+		// 空串与无引号内容
+		{"empty string", "lower", "", ""},
+		{"no quotes at all", "lower", `select 1`, `select 1`},
+		// 引号未闭合时不应 panic，剩余内容原样输出
+		{"unterminated quote", "lower", `create table "Sys`, `create table "sys`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			viper.Set("identifierCase", tt.mode)
+			t.Cleanup(viper.Reset)
+			if got := applyCaseToDDL(tt.in); got != tt.want {
+				t.Errorf("applyCaseToDDL(%q) with mode %q = %q, want %q", tt.in, tt.mode, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestApplyCase 覆盖单个标识符(表名/列名，不带引号)的转换。
+func TestApplyCase(t *testing.T) {
+	tests := []struct {
+		mode string
+		in   string
+		want string
+	}{
+		{"preserve", "userName", "userName"},
+		{"", "userName", "userName"},
+		{"lower", "userName", "username"},
+		{"upper", "userName", "USERNAME"},
+		{"lower", "sys_user", "sys_user"},
+		{"upper", "sys_user", "SYS_USER"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.mode+"_"+tt.in, func(t *testing.T) {
+			viper.Set("identifierCase", tt.mode)
+			t.Cleanup(viper.Reset)
+			if got := applyCase(tt.in); got != tt.want {
+				t.Errorf("applyCase(%q) with mode %q = %q, want %q", tt.in, tt.mode, got, tt.want)
+			}
+		})
+	}
+}
 
 // TestQuoteDefault 覆盖 tableCreateFailed.log 中出现的真实默认值，
 // 确保 MySQL 裸值被正确补上单引号(时间/枚举)，而数值与表达式保持原样。
@@ -91,6 +183,52 @@ func TestQuoteLiteral(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := quoteLiteral(tt.in); got != tt.want {
 				t.Errorf("quoteLiteral(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDestNullableFor 覆盖 notNullPolicy 的三种策略。
+// 默认 time 策略是为了让时间列能接收迁移时被置 NULL 的零值日期；
+// all 用于彻底规避非空冲突；keep 则完全照搬源库声明。
+func TestDestNullableFor(t *testing.T) {
+	tests := []struct {
+		name       string
+		policy     string
+		isNullable string
+		dataType   string
+		want       string
+	}{
+		// time（默认）：只放宽时间列
+		{"time: not null int stays", "time", "NO", "int", "not null"},
+		{"time: not null varchar stays", "time", "NO", "varchar", "not null"},
+		{"time: not null timestamp relaxed", "time", "NO", "timestamp", "null"},
+		{"time: not null datetime relaxed", "time", "NO", "datetime", "null"},
+		{"time: not null date relaxed", "time", "NO", "date", "null"},
+		{"time: nullable stays nullable", "time", "YES", "int", "null"},
+		{"unset falls back to time", "", "NO", "timestamp", "null"},
+		{"unset keeps not null int", "", "NO", "int", "not null"},
+		{"unknown value falls back to time", "whatever", "NO", "timestamp", "null"},
+
+		// all：全部放宽
+		{"all: int relaxed", "all", "NO", "int", "null"},
+		{"all: varchar relaxed", "all", "NO", "varchar", "null"},
+		{"all: already nullable", "all", "YES", "int", "null"},
+		{"all: case insensitive", "ALL", "NO", "int", "null"},
+
+		// keep：完全照搬源库
+		{"keep: not null preserved", "keep", "NO", "timestamp", "not null"},
+		{"keep: not null int preserved", "keep", "NO", "int", "not null"},
+		{"keep: nullable preserved", "keep", "YES", "int", "null"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			viper.Set("notNullPolicy", tt.policy)
+			t.Cleanup(viper.Reset)
+			if got := destNullableFor(tt.isNullable, tt.dataType); got != tt.want {
+				t.Errorf("destNullableFor(%q, %q) with policy %q = %q, want %q",
+					tt.isNullable, tt.dataType, tt.policy, got, tt.want)
 			}
 		})
 	}

@@ -216,11 +216,258 @@ func quoteLiteral(s string) string {
 - 反斜杠不处理：假定目标库 `standard_conforming_strings` 为 on
   （PostgreSQL 9.1 起的默认值，也是 SQL 标准行为）
 
+### 六、标识符大小写改为可配置
+
+#### 16. 新增 `identifierCase` 配置项
+
+原先是硬编码：列名强制小写、表名保留原始。现改为按 yml 配置统一处理。
+
+```yaml
+identifierCase: preserve   # preserve(默认) | lower | upper
+```
+
+| 取值 | 行为 |
+|---|---|
+| `preserve` | 保留原始大小写（**默认**），与 MySQL 源库一致 |
+| `lower` | 全部转为小写 |
+| `upper` | 全部转为大写 |
+
+未配置或取值无法识别时按 `preserve` 处理。选择 `preserve` 作默认值是为了与
+第四节修复后的行为一致，不改动已有配置文件的结果。
+
+#### 实现：按双引号边界扫描
+
+新增三个函数：
+
+| 函数 | 用途 |
+|---|---|
+| `caseMode()` | 读取配置，返回 `lower` / `upper` / 空串(保留) |
+| `applyCase(name)` | 转换单个标识符（不含引号），用于 `pq.CopyIn` 的入参 |
+| `applyCaseToDDL(ddl)` | 转换 DDL 中**双引号包裹**的标识符 |
+
+`applyCaseToDDL` 之所以按引号扫描而不是整句转换，是因为 **SQL 的字符串字面量用单引号**：
+
+```sql
+alter table "Sys_User" alter column "userID" set default nextval('seq_Sys_User_userID')
+              ↑ 转换              ↑ 转换                        ↑ 必须原样保留
+```
+
+序列名以字面量形式出现在 `nextval()` 里，必须和 `create sequence` 生成的名字完全一致
+（序列名生成时统一取小写且不加引号，PostgreSQL 会折叠成小写），一旦被改写就对不上。
+未加引号的标识符（索引名、约束名）也不处理——它们本就会被 PostgreSQL 折叠成小写。
+
+#### 作用点（共 15 处）
+
+| 模块 | 转换对象 |
+|---|---|
+| `TableCreate` | 建表语句、删表语句、表注释、列注释 |
+| `preMigData` | `truncate table` |
+| `runMigration` | `pq.CopyIn` 的表名与列名入参 |
+| `IdxCreate` | 索引 DDL、DISTRIBUTE BY 语句 |
+| `FKCreate` | 外键 DDL |
+| `SeqCreate` | `drop sequence` / `create sequence` / `alter table ... set default` |
+
+**视图未纳入**：`ViewCreate` 的视图名不加引号，视图体内的列引用也已被去掉反引号。
+若给视图名加引号而视图体不变，反而会破坏当前能正常工作的混合大小写视图
+（目前视图名与视图体都折叠成小写，是自洽的）。因此视图仅在 `lower` 模式下可靠，
+详见第四节「已知限制」。
+
+### 七、连接健壮性
+
+#### 17. 目标库连接池没有任何配置
+
+`PrepareSrc` 设了三项，`PrepareDest` **一项都没有**，全用 `database/sql` 的默认值：
+
+| 配置项 | 原实际值 | 后果 |
+|---|---|---|
+| `ConnMaxLifetime` | 0 = **连接永不过期** | 服务端或中间设备关掉连接后池子不知道，下次复用死连接就拿到 `ECONNRESET` |
+| `MaxOpenConns` | 0 = 不限 | 连接数只受 `maxParallel` 间接约束 |
+| `MaxIdleConns` | 默认 2 | 每轮并发干完关掉大部分连接、下一轮重新建，几千张表累计几万次建连/断连，易触发防火墙速率限制 |
+
+现已补齐：
+
+```go
+destDb.SetConnMaxLifetime(30 * time.Minute)
+destDb.SetConnMaxIdleTime(5 * time.Minute)
+destDb.SetMaxIdleConns(maxParallel)
+destDb.SetMaxOpenConns(maxParallel + 2)
+```
+
+> 典型症状就是 `tableCreateFailed.log` 里出现 `{"Op":"read","Net":"tcp",...,"Err":{"Syscall":"wsarecv","Err":10054}}`。
+> 这是操作系统网络层的 `WSAECONNRESET`，**不是 SQL 错误**——日志里那条语句只是断连时恰好正在执行的，
+> 并不代表语句有问题。
+
+#### 18. 连接类错误自动重试
+
+原先目标库执行失败直接 `failedCount += 1`，**没有任何重试**，一次网络抖动就永久丢掉一张表。
+
+新增 `isRetryableConnErr()` 区分错误类型：
+
+| 类别 | 例子 | 是否重试 |
+|---|---|---|
+| 连接类 | `ECONNRESET` / `EPIPE` / `EOF` / `ErrBadConn` / `57P01`(服务端关闭) | ✅ 重试 3 次，退避 1s、2s |
+| SQL 层 | `23502` 非空冲突 / `42601` 语法 / `42703` 列不存在 | ❌ 不重试 |
+
+**SQL 层错误绝不能重试**——重试多少次结果都一样，只会浪费时间并掩盖真正的问题。
+
+两个执行路径都覆盖：
+
+- `execDest()` 包裹目标库全部 DDL 执行点（建表、删表、注释、索引、外键、序列、视图、触发器、truncate），共 13 处
+- `runMigration` 对 COPY 做**整页重试**——COPY 是流式的，中途断连无法从断点续传，只能整页重来；源库会重新查询，目标库上该页的事务已回滚，不会留下半截数据
+
+`isRetryableConnErr` 的 SQLSTATE 判断退化为匹配消息文本，因为目标库可能由
+`postgres` / `opengauss` / `highgo` 三种驱动之一连接，它们的 Error 类型各不相同。
+
+#### 19. 顺带修复：并发信号量泄漏
+
+原 `runMigration` 有三条 `return` 路径各自写 `<-ch`，其中 `srcDb.Query` 失败那条**漏写了**。
+每次触发都会永久泄漏一个并发槽位，积累到 `maxParallel` 个之后主循环的
+`ch <- struct{}{}` 会永久阻塞，**程序死锁**。
+
+重构后 `runMigration` 拆为两层：
+
+- `migratePage()` —— 只负责搬运与记日志，返回 `error`，**不碰通道与等待组**
+- `runMigration()` —— 负责重试与并发记账，`<-ch` **只在函数末尾出现一次**
+
+同时补上了缺失的事务回滚：`migratePage` 用 `defer txn.Rollback()` 兜底，
+避免提前返回时连接被未结束的事务占住（提交后调用 `Rollback` 只返回 `ErrTxDone`，可安全忽略）。
+
+### 八、应用代码对齐工具
+
+#### 20. 新增 `dumpSchema` 子命令
+
+```bash
+gomysql2pg --config configs/01_xxx.yml dumpSchema -o schema.json
+```
+
+读取**目标库的真实结构**（`information_schema.columns` 关联 `information_schema.tables`），
+输出 JSON 字段清单：表名/视图名 + 每个列名及其真实大小写。
+
+之所以读目标库而不是从 MySQL 元数据推算：后者需要重放 `caseMode()`/`applyCaseToDDL()`
+的转换逻辑，两边一旦有出入，下游工具就会拿着错误的列名去改应用代码。
+
+清单里带上生成时的 `identifierCase` 取值，消费方据此判断裸标识符是否有问题。
+只读，不创建任何对象。
+
+**迁移结束时会自动导出一份**到本次运行的日志目录（`<logDir>/schema.json`），
+不必再单独跑一次命令，也保证清单与这一次运行严格对应。导出失败只记 warning，
+不影响迁移结果。
+
+底层查 `pg_catalog` 而不是 `information_schema`，原因有两条：
+
+- `information_schema` 按当前用户权限过滤，权限不足时"查不到"与"这个 schema
+  里确实没表"返回相同的空集，无法区分
+- `information_schema.tables` 不含物化视图，用它做 inner join 会把这类对象丢掉
+
+查不到对象时会**列出目标库里真正含表的 schema 及对象数**——本工具建表时不带
+schema 前缀，落点由目标库的 `search_path` 决定，与 `dest.username` 不一致是常见情况
+（例如都落进了 `public`），单纯报一句"没找到"毫无帮助。
+
+#### 21. 新增 `tools/php_schema_align/` PHP 代码对齐工具
+
+迁移到 PostgreSQL 后，PHP 工程里引用列名的写法有五大类，**每类都要单独加一层检测**：
+
+| 类别 | 例子 | 为何失效 |
+|---|---|---|
+| SQL 反引号 | ``select `SN` from t`` | PostgreSQL 不支持反引号，语法错误 |
+| SQL 未加引号 | `select SN from t` | ✅ 不用改——PG 折叠成小写正好匹配 |
+| PHP 数组键 | `$row['SN']`、`'SN' => $v` | 结果集键跟着列名走；写入时框架拿数组键当列名 |
+| 函数 / 方法字符串参数 | `array_column($rows,'SN')`、`$this->m('SN')` | 取不到时**静默返回空**，不报错 |
+| Smarty 属性 | `{$v.SN}`、`{$v->SN}`、`{$v.0.SN}` | 编译成 `$v['SN']` / `$v->SN` |
+
+**这份清单是逐轮补出来的**，每发现一种新写法就加一层。中间的两次修正值得记：
+
+- `$smarty.session.bsh.nameType` 最初被误判成列名——它读的是 `$_SESSION`，
+  改成小写会和会话写入端对不上。同类误判还有内层 `$_SESSION['bsh']['x']`
+  （第二层 `[` 前面是 `]` 不是 `$_SESSION`，只查一层会漏掉）
+- Smarty 的 `$part1_1.0.Name` 最初匹配不上——`->` 和 `.` 的分段正则要求每段
+  以字母开头，数字索引 `.0` 直接让整条链断掉
+
+详见 `tools/php_schema_align/README.md`。
+
+**关键实现点：替换文本要同时满足 SQL 和 PHP 两层语法。**
+
+最初版本直接把反引号换成 `"`，结果在 PHP 双引号字符串里提前结束了字符串：
+
+```php
+// 错误：$sql 被截断成 "SELECT " ，后面全是语法错误
+$sql = "SELECT "ID", "userName" FROM "sys_user"";
+```
+
+正确做法按 PHP 字符串种类分别处理：
+
+| PHP 写法 | 反引号替换为 |
+|---|---|
+| 双引号串 | `\"userName\"`（必须转义） |
+| 单引号串 / nowdoc | `"userName"` |
+| heredoc | `"userName"`（同双引号串行为，但引号不需转义） |
+
+**只处理字符串字面量内部**，因此 PHP 的反引号运算符（执行 shell 命令）和注释里的
+反引号天然不会被误伤。
+
+#### 21.1 可选：前后端命名统一（`--unify-names`）
+
+上面几类只解决**数据库相关**的改名。做完之后可能还剩一种跨层不一致：
+
+```
+数据库列 enname  ←→  HTML 表单 name="EnName"  ←→  JS $('#EnName')
+```
+
+`--unify-names` 生成补丁消除这层差异，**只出 `unify_names.patch`，不改源文件**。
+覆盖 HTML `name`/`id`、JS 取值、会话键、Smarty 会话，以及 `extract()` 解出的
+表单变量——这几层**必须成组联动**，漏一处就静默失效。
+
+**刻意不改：被赋过值的 PHP 变量。**
+
+```php
+$AppendType = "kyxm";                            // 存的是【值】
+"... and AppendType='".$AppendType."' ..."       //     ↑列名      ↑值
+```
+
+`$AppendType` 与列 `AppendType` 同名只是历史巧合。改它对迁移毫无作用，却有
+**合并风险**——扫描发现 24 个文件同时存在两种大小写的同名变量，合并会改变行为。
+
+应用后必须**清 Smarty 缓存**并**跑一遍完整表单提交流程**——跨层改名无法靠读
+报告验收，只能靠实际运行。
+
+**安全设计**：默认只出报告；`--apply` 先打印计划等确认；写前备份 `.bak`；
+写完若系统有 `php` 则跑 `php -l`，**语法检查不通过自动回滚**。
+
+### 九、not null 约束改为可配置
+
+#### 22. 新增 `notNullPolicy` 配置项
+
+原先的放宽规则是硬编码的（`isNullable != "NO" || isTimeType(...)`），
+现改为按 yml 配置决定。
+
+```yaml
+notNullPolicy: time   # time(默认) | all | keep
+```
+
+| 取值 | 行为 |
+|---|---|
+| `time` | 只放宽时间列（**默认**，与改动前一致） |
+| `all` | 所有列都建为可空，彻底规避 `23502` 非空冲突 |
+| `keep` | 完全按 MySQL 的 `is_nullable` 原样保留，不放宽任何列 |
+
+未配置或取值无法识别时按 `time` 处理，不影响已有配置文件。
+
+新增 `destNullableFor(isNullable, dataType)` 承载这段判断，可单元测试覆盖。
+
+> **关于「`not null` 改成 `default null`」**：PostgreSQL 里可空且无 `DEFAULT`
+> 的列，插入时不带该列即为 `NULL`，`DEFAULT NULL` 是冗余写法，因此这里只输出
+> 列级约束（`null` / `not null`），不额外拼 `DEFAULT NULL`。
+
 ### 变更文件
 
 | 文件 | 说明 |
 |---|---|
-| `cmd/tablemeta.go` | 建表逻辑：类型映射、默认值、可空性、标识符引用、注释同步 |
+| `cmd/dumpschema.go` | 新增，字段清单导出子命令 |
+| `tools/php_schema_align/` | 新增，PHP 代码对齐扫描/改写工具 |
+| `cmd/tablemeta.go` | 建表逻辑：类型映射、默认值、可空性、标识符引用、注释同步、大小写配置 |
+| `cmd/root.go` | 数据迁移逻辑、日志摘要、分页语句构造、COPY 标识符大小写、连接错误重试 |
+| `cmd/app.go` | 目标库连接池配置 |
+| `example.yml` | 新增 `identifierCase` 配置项及说明 |
 | `check_log.sh` / `check_log.ps1` | 失败清单新增 `commentFailed.log` |
 | `cmd/root.go` | 数据迁移逻辑、日志摘要、分页语句构造 |
 | `cmd/tablemeta_test.go` | 新增，71 个用例 |

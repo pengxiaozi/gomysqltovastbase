@@ -3,10 +3,13 @@ package cmd
 import (
 	"bytes"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"github.com/lib/pq"
+	"io"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -248,6 +251,10 @@ func mysql2pg(connStr *connect.DbConnStr) {
 	table.Align("FailedTotal", 1)
 	table.Align("ElapsedTime", 1)
 	fmt.Println(table)
+	// 把目标库的字段清单写进本次日志目录，供应用代码对齐工具使用。
+	// 迁移本来就要读目标库，顺手导出省掉单独跑一次 dumpSchema；
+	// 放在最后是为了让清单包含视图等全部对象。失败不影响迁移结果。
+	writeSchemaManifest(destDb, logDir, connStr)
 	// 总耗时
 	cost := time.Since(start)
 	log.Info(fmt.Sprintf("All complete totalTime %s The Report Dir %s", cost, logDir))
@@ -345,8 +352,8 @@ func countDbObjects(db *sql.DB, query string) int {
 func preMigData(tableName string, sqlFullSplit []string) (dbCol []string, dbColType []string, tableNotExist bool) {
 	var sqlCol string
 	// 在写数据前，先清空下目标表数据
-	truncateSql := "truncate table " + fmt.Sprintf("\"") + tableName + fmt.Sprintf("\"")
-	if _, err := destDb.Exec(truncateSql); err != nil {
+	truncateSql := applyCaseToDDL("truncate table " + fmt.Sprintf("\"") + tableName + fmt.Sprintf("\""))
+	if _, err := execDest(truncateSql); err != nil {
 		log.Error("truncate ", tableName, " failed   ", err)
 		tableNotExist = true
 		return // 表不存在return布尔值
@@ -457,20 +464,118 @@ func errSummary(err error) string {
 	return strings.ReplaceAll(strings.TrimSpace(err.Error()), "\n", " ")
 }
 
-// 根据源sql查询语句，按行遍历使用copy方法迁移到目标数据库
+// maxRetryTimes 连接类错误的整页/整语句重试次数。
+// SQL 层错误(语法、约束、类型)不重试——重试多少次结果都一样，
+// 只会浪费时间并掩盖真正的问题。
+const maxRetryTimes = 3
+
+// isRetryableConnErr 判断错误是否属于「重试有意义」的连接类故障。
+//
+// 这类故障由网络层或服务端重启引起，与语句内容无关：
+//   - 连接被对端强制关闭(Windows 上表现为 Errno 10054 WSAECONNRESET)
+//   - 服务端重启或被 kill 导致的 EOF、broken pipe
+//   - database/sql 判定连接已失效的 driver.ErrBadConn
+//
+// SQLSTATE 那一项退化为匹配消息文本，是因为目标库可能由 postgres / opengauss /
+// highgo 三种驱动之一连接，它们的 Error 类型各不相同，为每一种单独引依赖不划算。
+func isRetryableConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// 系统/网络层错误，与驱动无关，最可靠
+	if errors.Is(err, driver.ErrBadConn) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	msg := err.Error()
+	for _, s := range []string{
+		"57P01", "57P02", "57P03", // 服务端关闭 / 崩溃重启 / 暂不可连接
+		"terminating connection",
+		"connection reset",
+		"connection refused",
+		"broken pipe",
+		"unexpected EOF",
+		"server closed the connection",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// execDest 在目标库执行语句，遇到连接类错误自动重试。
+// database/sql 只对 driver.ErrBadConn 自动重试，像 ECONNRESET 这种在读取阶段
+// 发生的错误会直接抛给调用方，一次网络抖动就会让整张表创建失败。
+func execDest(query string, args ...interface{}) (sql.Result, error) {
+	var err error
+	for attempt := 1; attempt <= maxRetryTimes; attempt++ {
+		var res sql.Result
+		if res, err = destDb.Exec(query, args...); err == nil {
+			return res, nil
+		}
+		if !isRetryableConnErr(err) || attempt == maxRetryTimes {
+			break
+		}
+		log.Warn(fmt.Sprintf("dest exec hit connection error, retry %d/%d: %v", attempt, maxRetryTimes, err))
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	return nil, err
+}
+
+// 根据源sql查询语句，按行遍历使用copy方法迁移到目标数据库。
+// 负责整页重试与并发记账(通道/等待组)，具体搬运交给 migratePage。
 func runMigration(logDir string, startPage int, tableName string, sqlStr string, ch chan struct{}, columns []string, colType []string) {
 	defer wg.Done()
 	log.Info(fmt.Sprintf("%v Taskid[%d] Processing TableData %v", time.Now().Format("2006-01-02 15:04:05.000000"), startPage, tableName))
 	start := time.Now()
+
+	// 连接类错误整页重试：COPY 是流式的，中途断连无法从断点续传，只能整页重来。
+	// 源库会重新查询，目标库上该页的事务已回滚，不会留下半截数据。
+	var err error
+	for attempt := 1; attempt <= maxRetryTimes; attempt++ {
+		if err = migratePage(logDir, tableName, sqlStr, columns, colType); err == nil {
+			break
+		}
+		if !isRetryableConnErr(err) || attempt == maxRetryTimes {
+			break
+		}
+		log.Warn(fmt.Sprintf("table %s page %d hit connection error, retry %d/%d: %v", tableName, startPage, attempt, maxRetryTimes, err))
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	cost := time.Since(start)
+
+	// 通道只在这里释放一次。原先三条 return 路径各自写 <-ch，
+	// 其中 srcDb.Query 失败那条漏写了，并发信号量会永久泄漏直至死锁。
+	if err != nil {
+		responseChannel <- fmt.Sprintf("data error %s", tableName)
+		<-ch
+		return
+	}
+	log.Info(fmt.Sprintf("%v Taskid[%d] table %v complete,execTime %s", time.Now().Format("2006-01-02 15:04:05.000000"), startPage, tableName, cost))
+	<-ch
+}
+
+// migratePage 迁移一个分页(无主键的表则为整表)的数据，成功返回 nil。
+// 只负责搬运和记日志，不碰通道与等待组，由 runMigration 统一处理重试和并发记账。
+func migratePage(logDir string, tableName string, sqlStr string, columns []string, colType []string) error {
 	// 直接查询,即查询全表或者分页查询(SELECT t.* FROM (SELECT id FROM test  ORDER BY id LIMIT ?, ?) temp LEFT JOIN test t ON temp.id = t.id;)
 	sqlStr = "/* gomysql2pg */" + sqlStr
 	// 查询源库的sql
 	rows, err := srcDb.Query(sqlStr) //传入参数之后执行
-	defer rows.Close()
 	if err != nil {
 		log.Error(fmt.Sprintf("[exec  %v failed ] ", sqlStr), err)
-		return
+		return err
 	}
+	defer rows.Close()
 	//fmt.Println(dbCol)  //输出查询语句里各个字段名称
 	values := make([]sql.RawBytes, len(columns)) // 列的值切片,包含多个列,即单行数据的值
 	scanArgs := make([]interface{}, len(values)) // 用来做scan的参数，将上面的列值value保存到scan
@@ -480,13 +585,22 @@ func runMigration(logDir string, startPage int, tableName string, sqlStr string,
 	txn, err := destDb.Begin() //开始一个事务
 	if err != nil {
 		log.Error(err)
+		return err
 	}
-	stmt, err := txn.Prepare(pq.CopyIn(tableName, columns...)) //prepare里的方法CopyIn只是把copy语句拼接好并返回，并非直接执行copy
+	// 任何提前返回都回滚，避免连接被未结束的事务占住。
+	// 提交之后再调 Rollback 只会返回 ErrTxDone，可安全忽略。
+	defer func() { _ = txn.Rollback() }()
+	// COPY 的表名与列名必须和建表时用同一套 identifierCase 规则，
+	// 否则目标表的列名对不上，COPY 直接报 column does not exist。
+	// 这里单独建一份，columns 本身还要用于取列类型和日志，不能就地改。
+	copyColumns := make([]string, len(columns))
+	for i, c := range columns {
+		copyColumns[i] = applyCase(c)
+	}
+	stmt, err := txn.Prepare(pq.CopyIn(applyCase(tableName), copyColumns...)) //prepare里的方法CopyIn只是把copy语句拼接好并返回，并非直接执行copy
 	if err != nil {
 		log.Error("txn Prepare pq.CopyIn failed ", err)
-		//ch <- 1 // 执行pg的copy异常就往通道写入1
-		<-ch   // 通道向外发送
-		return // 遇到CopyIn异常就直接return
+		return err
 	}
 	var totalRow int                                   // 表总行数
 	prepareValues := make([]interface{}, len(columns)) //用于给copy方法，一行数据的切片，里面各个元素是各个列字段值
@@ -552,16 +666,12 @@ func runMigration(logDir string, startPage int, tableName string, sqlStr string,
 			log.Error("stmt.Exec(prepareValues...) failed ", tableName, " ", err) // 这里是按行来的，不建议在这里输出错误信息,建议如果遇到一行错误就直接return返回
 			LogAlterSql(logDir, "failedTable", tableName+" -- "+errSummary(err))
 			LogError(logDir, "errorTableData", StrVal(prepareValues), err)
-			//ch <- 1
-			// 通过外部的全局变量通道获取到迁移行数据失败的计数
-			responseChannel <- fmt.Sprintf("data error %s", tableName)
-			<-ch   // 通道向外发送数据
-			return // 如果prepare异常就return
+			return err
 		}
 	}
 	err = rows.Close()
 	if err != nil {
-		return
+		return err
 	}
 	_, err = stmt.Exec() //把所有的buffer进行flush，一次性写入数据
 	if err != nil {
@@ -569,27 +679,18 @@ func runMigration(logDir string, startPage int, tableName string, sqlStr string,
 		LogAlterSql(logDir, "failedTable", tableName+" -- "+errSummary(err))
 		// 在copy过程中异常的表，将异常信息输出到平面文件
 		LogError(logDir, "errorTableData", StrVal(prepareValues), err)
-		//ch <- 2
-		// 通过外部的全局变量通道获取到迁移行数据失败的计数
-		responseChannel <- fmt.Sprintf("data error %s", tableName)
-		<-ch // 通道向外发送数据
+		return err
 	}
 	err = stmt.Close() //关闭stmt
 	if err != nil {
 		log.Error(err)
 	}
-	err = txn.Commit() // 提交事务，这里注意Commit在上面Close之后
-	if err != nil {
-		err := txn.Rollback()
-		if err != nil {
-			return
-		}
+	if err = txn.Commit(); err != nil { // 提交事务，这里注意Commit在上面Close之后
 		log.Error("Commit failed ", err)
+		return err
 	}
-	cost := time.Since(start) //计算时间差
-	log.Info(fmt.Sprintf("%v Taskid[%d] table %v complete,processed %d rows,execTime %s", time.Now().Format("2006-01-02 15:04:05.000000"), startPage, tableName, totalRow, cost))
-	//ch <- 0
-	<-ch // 通道向外发送数据
+	log.Info(fmt.Sprintf("%v table %v complete,processed %d rows", time.Now().Format("2006-01-02 15:04:05.000000"), tableName, totalRow))
+	return nil
 }
 
 func Execute() { // init 函数初始化之后再运行此Execute函数

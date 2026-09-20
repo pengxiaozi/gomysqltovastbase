@@ -81,6 +81,19 @@ func PrepareDest(connStr *connect.DbConnStr) {
 	if c != nil {
 		log.Fatal("connect Postgres failed", c)
 	}
+	// 连接池配置。原先目标库一项都没设，全用 database/sql 的默认值：
+	//   ConnMaxLifetime=0 表示「连接永不过期」——服务端或中间设备把连接关掉后
+	//     池子并不知道，下次复用这条死连接就会拿到 ECONNRESET；
+	//   MaxIdleConns 默认只有 2——每轮并发干完会关掉大部分连接、下一轮重新建，
+	//     几千张表跑下来就是几万次建连/断连，容易触发防火墙的连接速率限制。
+	maxParallel := viper.GetInt("maxParallel")
+	if maxParallel <= 0 {
+		maxParallel = 20
+	}
+	destDb.SetConnMaxLifetime(30 * time.Minute) // 超时强制回收，避免复用被中间设备掐断的连接
+	destDb.SetConnMaxIdleTime(5 * time.Minute)  // 空闲过久同样回收
+	destDb.SetMaxIdleConns(maxParallel)         // 空闲连接数与并发数对齐，避免每批任务反复建连
+	destDb.SetMaxOpenConns(maxParallel + 2)     // 并发数加余量，防止连接数失控
 	log.Info("connect Postgres ", destHost, " success")
 }
 

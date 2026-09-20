@@ -47,6 +47,50 @@ type Table struct {
 	viewSql                string
 }
 
+// notNullPolicy 读取 yml 的 notNullPolicy 配置。
+//
+//	time —— 只放宽时间列（默认）
+//	all  —— 所有列都建为可空
+//	keep —— 完全按 MySQL 的 is_nullable 原样保留
+//
+// 未配置或取值无法识别时按 time 处理。
+func notNullPolicy() string {
+	switch strings.ToLower(strings.TrimSpace(viper.GetString("notNullPolicy"))) {
+	case "all":
+		return "all"
+	case "keep":
+		return "keep"
+	default:
+		return "time"
+	}
+}
+
+// destNullableFor 决定目标列的可空性，返回 "null" 或 "not null"。
+//
+// 默认策略是只放宽时间列：MySQL 在非严格 SQL 模式下允许把非法日期
+// （如 0000-00-00）写进 not null 的时间列，所以这类列声明的 not null
+// 并不可信；PostgreSQL 无法表示零值日期，迁移时会把它们置为 NULL，
+// 建表必须跟着放宽，否则 COPY 会撞 23502 非空冲突。
+//
+// PostgreSQL 里可空且无 DEFAULT 的列，插入时不带该列即为 NULL，
+// 不需要额外写 DEFAULT NULL，所以这里只输出列级约束。
+func destNullableFor(isNullable, dataType string) string {
+	switch notNullPolicy() {
+	case "all":
+		return "null"
+	case "keep":
+		if isNullable != "NO" {
+			return "null"
+		}
+		return "not null"
+	default: // time
+		if isNullable != "NO" || isTimeType(dataType) {
+			return "null"
+		}
+		return "not null"
+	}
+}
+
 // isTimeType 判断是否为 MySQL 的时间类型。
 // 类型名大小写不敏感：建表路径取 information_schema 的小写，
 // 迁移路径取驱动 DatabaseTypeName 的大写。
@@ -109,6 +153,126 @@ func quoteLiteral(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
+// caseMode 读取 yml 的 identifierCase 配置。
+// 取值 lower(全小写) / upper(全大写) / preserve(保留原始，默认)。
+// 未配置或取值无法识别时按 preserve 处理，返回空串。
+func caseMode() string {
+	switch strings.ToLower(strings.TrimSpace(viper.GetString("identifierCase"))) {
+	case "lower":
+		return "lower"
+	case "upper":
+		return "upper"
+	default:
+		return ""
+	}
+}
+
+// applyCase 按 identifierCase 转换单个标识符(表名/列名，不含引号)。
+func applyCase(name string) string {
+	switch caseMode() {
+	case "lower":
+		return strings.ToLower(name)
+	case "upper":
+		return strings.ToUpper(name)
+	default:
+		return name
+	}
+}
+
+// applyCaseToDDL 按 identifierCase 转换 DDL 中双引号包裹的标识符。
+//
+// 之所以按引号扫描而不是整句转换：SQL 的字符串字面量用的是单引号，
+// 这样 nextval('seq_x_y') 里的内容不会被误改，序列名才能和 create sequence 对上。
+// 未加引号的标识符(索引名、约束名)不处理——PostgreSQL 本就会把它们折叠成小写，
+// 与生成这些 DDL 时的不加引号写法保持一致。
+func applyCaseToDDL(ddl string) string {
+	if caseMode() == "" {
+		return ddl
+	}
+	var b strings.Builder
+	b.Grow(len(ddl))
+	segStart := 0 // 当前双引号段在 ddl 中的起点(不含引号本身)
+	inQuote := false
+	for i := 0; i < len(ddl); i++ {
+		if ddl[i] != '"' {
+			continue
+		}
+		if !inQuote {
+			b.WriteString(ddl[segStart:i]) // 引号外的内容原样保留
+			inQuote = true
+		} else {
+			b.WriteString(applyCase(ddl[segStart:i])) // 引号内的标识符按配置转换
+			inQuote = false
+		}
+		b.WriteByte('"')
+		segStart = i + 1
+	}
+	// 收尾：引号未闭合时，剩余部分仍处在标识符段内，按标识符处理，
+	// 与循环里已进入引号段的状态保持一致(正常生成的 DDL 不会走到这里)
+	if inQuote {
+		b.WriteString(applyCase(ddl[segStart:]))
+	} else {
+		b.WriteString(ddl[segStart:])
+	}
+	return b.String()
+}
+
+// ensureTimeColumnTypes 建表后核对时间列的实际类型，不对就改回来。
+//
+// 有些目标库（GaussDB 的部分兼容模式）会把 DDL 里写的 timestamp 落成
+// timestamp WITH time zone，数据读出来就带上 +08 偏移。这是目标库单方面的
+// 解释，改工具的 DDL 治不了根——所以建完表先查一遍实际类型。
+//
+// 此时表刚建好、还没有数据，直接改类型不存在"按哪个时区还原"的歧义，
+// 这也是放在灌数据之前做的原因。
+func ensureTimeColumnTypes(logDir, tblName string) {
+	const q = `SELECT a.attname, format_type(a.atttypid, a.atttypmod)
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+WHERE c.relname = $1
+  AND n.nspname = current_schema()
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+  AND format_type(a.atttypid, a.atttypmod)
+      IN ('timestamp with time zone', 'time with time zone')
+ORDER BY a.attnum`
+
+	rows, err := destDb.Query(q, tblName)
+	if err != nil {
+		log.Warn("check time column types failed ", tblName, " ", err)
+		return
+	}
+	var actions []string
+	for rows.Next() {
+		var col, actual string
+		if err := rows.Scan(&col, &actual); err != nil {
+			log.Warn("scan time column type failed ", err)
+			continue
+		}
+		want := "timestamp without time zone"
+		if strings.HasPrefix(actual, "time with") {
+			want = "time without time zone"
+		}
+		actions = append(actions, fmt.Sprintf("alter column %s type %s",
+			quoteLiteral(col), want))
+		log.Warnf("table %s column %s is %q on target, fixing to %q",
+			tblName, col, actual, want)
+	}
+	_ = rows.Close()
+	if len(actions) == 0 {
+		return
+	}
+
+	// 一次 ALTER 改完所有列，避免每列一个来回
+	sql := applyCaseToDDL("alter table " + fmt.Sprintf("\"") + tblName +
+		fmt.Sprintf("\"") + " " + strings.Join(actions, ", "))
+	if _, err := execDest(sql); err != nil {
+		log.Error("fix time column types failed ", tblName, " ", sql, " ", err)
+		LogError(logDir, "tableCreateFailed", sql, err)
+	}
+}
+
 func (tb *Table) TableCreate(logDir string, tblName string, ch chan struct{}) {
 	defer wg2.Done()
 	var newTable Table
@@ -146,16 +310,8 @@ func (tb *Table) TableCreate(logDir string, tblName string, ch chan struct{}) {
 		}
 		//fmt.Println(columnName,dataType,characterMaximumLength,isNullable,columnDefault,numericPrecision,numericScale,datetimePrecision,columnKey,columnComment,ordinalPosition)
 		//适配MySQL字段类型到PostgreSQL字段类型
-		// 列字段是否允许null。
-		// 时间类型例外：MySQL 在非严格 SQL 模式下允许把非法日期(如 0000-00-00)
-		// 写进 not null 的时间列，所以这类列声明的 not null 并不可信。
-		// PostgreSQL 无法表示零值日期，迁移时会把它们置为 NULL，
-		// 因此目标库的时间列一律建为可空，与行数据的处理保持一致。
-		if newTable.isNullable != "NO" || isTimeType(newTable.dataType) {
-			newTable.destNullable = "null"
-		} else {
-			newTable.destNullable = "not null"
-		}
+		// 列字段是否允许null，策略由 notNullPolicy 配置决定
+		newTable.destNullable = destNullableFor(newTable.isNullable, newTable.dataType)
 		// 列字段default默认值的处理
 		switch {
 		case newTable.columnDefault == "null": // 没有默认值，目标也就不设默认值
@@ -189,7 +345,14 @@ func (tb *Table) TableCreate(logDir string, tblName string, ch chan struct{}) {
 		case "text", "tinytext", "mediumtext", "longtext":
 			newTable.destType = "text"
 		case "datetime", "timestamp":
-			newTable.destType = "timestamp"
+			// 类型名写全，不用裸 timestamp：
+			// 裸写法在不同目标库上的解释不一致——GaussDB 的部分兼容模式会把它
+			// 当成 timestamp WITH time zone，数据读出来就带上 +08 偏移。
+			// MySQL 的 DATETIME 是「墙上时间」，对应的正是 without time zone。
+			newTable.destType = "timestamp without time zone"
+		case "time":
+			// 同理：裸 time 可能被解释成 timetz，写全更稳
+			newTable.destType = "time without time zone"
 		case "decimal":
 			if newTable.numericScale == "null" {
 				newTable.destType = "decimal(" + newTable.numericPrecision + ")"
@@ -218,33 +381,38 @@ func (tb *Table) TableCreate(logDir string, tblName string, ch chan struct{}) {
 		// 收集列注释：空串表示没写注释，'null' 是查询里 ifnull 的哨兵值，两者都跳过。
 		// newTable.columnName 已由查询拼好双引号，可直接作为限定列名使用。
 		if cm := strings.TrimSpace(newTable.columnComment); cm != "" && cm != "null" {
-			commentSqls = append(commentSqls, "comment on column "+fmt.Sprintf("\"")+tblName+fmt.Sprintf("\"")+"."+newTable.columnName+" is "+quoteLiteral(cm))
+			commentSqls = append(commentSqls, applyCaseToDDL("comment on column "+fmt.Sprintf("\"")+tblName+fmt.Sprintf("\"")+"."+newTable.columnName+" is "+quoteLiteral(cm)))
 		}
 	}
 	//fmt.Println(pgCreateTbl) // 打印创建表语句
+	// 标识符大小写按 identifierCase 配置统一转换。建表与后续所有引用
+	// (COPY/索引/外键/序列)必须用同一套规则，否则会找不到列。
+	pgCreateTbl = applyCaseToDDL(pgCreateTbl)
 	// 创建前先删除目标表
-	dropDestTbl := "drop table if exists " + fmt.Sprintf("\"") + tblName + fmt.Sprintf("\"") + " cascade"
-	if _, err = destDb.Exec(dropDestTbl); err != nil {
+	dropDestTbl := applyCaseToDDL("drop table if exists " + fmt.Sprintf("\"") + tblName + fmt.Sprintf("\"") + " cascade")
+	if _, err = execDest(dropDestTbl); err != nil {
 		log.Error("drop table ", tblName, " failed ", err)
 	}
 	// 创建PostgreSQL表结构
 	log.Info(fmt.Sprintf("%v Table total %s create table %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(tableCount), tblName))
-	if _, err = destDb.Exec(pgCreateTbl); err != nil {
+	if _, err = execDest(pgCreateTbl); err != nil {
 		log.Error("table ", tblName, " create failed  ", err)
 		LogError(logDir, "tableCreateFailed", pgCreateTbl, err)
 		failedCount += 1
 	} else {
+		// 表刚建好、还没灌数据，此时纠正时间列类型没有数据转换歧义
+		ensureTimeColumnTypes(logDir, tblName)
 		// 表建好之后才能挂注释，所以放在这里而不是并进建表语句。
 		// 注释失败不影响表和数据的迁移，因此只记日志，不计入建表失败数。
 		if tc := strings.TrimSpace(tableComment); tc != "" {
-			cs := "comment on table " + fmt.Sprintf("\"") + tblName + fmt.Sprintf("\"") + " is " + quoteLiteral(tc)
-			if _, err = destDb.Exec(cs); err != nil {
+			cs := applyCaseToDDL("comment on table " + fmt.Sprintf("\"") + tblName + fmt.Sprintf("\"") + " is " + quoteLiteral(tc))
+			if _, err = execDest(cs); err != nil {
 				log.Error("comment on table ", tblName, " failed ", err)
 				LogError(logDir, "commentFailed", cs, err)
 			}
 		}
 		for _, cs := range commentSqls {
-			if _, err = destDb.Exec(cs); err != nil {
+			if _, err = execDest(cs); err != nil {
 				log.Error("comment on column ", tblName, " failed ", err)
 				LogError(logDir, "commentFailed", cs, err)
 			}
@@ -271,20 +439,25 @@ func (tb *Table) SeqCreate(logDir string) (result []string) {
 		if err := rows.Scan(&tableName, &tb.columnName, &tb.autoIncrement, &tb.dropSeqSql, &tb.destSeqSql, &tb.destDefaultSeq); err != nil {
 			log.Error(err)
 		}
+		// 序列 DDL 里的表名/列名带双引号，按配置转换；
+		// nextval('seq_x_y') 是单引号字面量，不会被转换，仍与 create sequence 的名字一致
+		tb.dropSeqSql = applyCaseToDDL(tb.dropSeqSql)
+		tb.destSeqSql = applyCaseToDDL(tb.destSeqSql)
+		tb.destDefaultSeq = applyCaseToDDL(tb.destDefaultSeq)
 		// 创建前先删除目标序列
-		if _, err = destDb.Exec(tb.dropSeqSql); err != nil {
+		if _, err = execDest(tb.dropSeqSql); err != nil {
 			log.Error(err)
 		}
 		// 创建目标序列
 		log.Info(fmt.Sprintf("%v ProcessingID %s create sequence %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(tableCount), tableName))
-		if _, err = destDb.Exec(tb.destSeqSql); err != nil {
+		if _, err = execDest(tb.destSeqSql); err != nil {
 			log.Error("table ", tableName, " create sequence failed ", err)
 			LogError(logDir, "seqCreateFailed", tb.destSeqSql, err)
 			failedCount += 1
 		}
 		// 设置表自增列为序列，如果表不存并单独创建序列会有error但是毫无影响
 		log.Info(fmt.Sprintf("%v ProcessingID %s set default sequence %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(tableCount), tableName))
-		if _, err = destDb.Exec(tb.destDefaultSeq); err != nil {
+		if _, err = execDest(tb.destDefaultSeq); err != nil {
 			log.Error("table ", tableName, " set default sequence failed ", err)
 			LogError(logDir, "seqCreateFailed", tb.destDefaultSeq, err)
 			failedCount += 1
@@ -329,10 +502,13 @@ func (tb *Table) IdxCreate(logDir string, excludeTable []string) (result []strin
 		if err := rows.Scan(&tb.destIdxSql, &indexName, &alterDistributeSql); err != nil {
 			log.Error(err)
 		}
+		// 索引 DDL 由 MySQL 侧拼装，标识符已用双引号包裹，这里按配置转换大小写
+		tb.destIdxSql = applyCaseToDDL(tb.destIdxSql)
+		alterDistributeSql = applyCaseToDDL(alterDistributeSql)
 		// 如果是分布式数据库，先更改分布列，这里挑选主键作为分布列,避免之前创建表没指定主键，某些数据库会自动挑选分布列，后面再加主键会遇到主键没包括分布列的问题
 		if strings.ToUpper(viper.GetString("Distributed")) == "TRUE" {
 			if indexName == "PRIMARY" {
-				if _, err = destDb.Exec(alterDistributeSql); err != nil {
+				if _, err = execDest(alterDistributeSql); err != nil {
 					log.Error(alterDistributeSql, " alter table DISTRIBUTE failed ", err)
 					LogError(logDir, "DistributedAlterFailed", tb.destIdxSql, err)
 					failedCount += 1
@@ -341,7 +517,7 @@ func (tb *Table) IdxCreate(logDir string, excludeTable []string) (result []strin
 		}
 		// 不管是不是分布式数据库，下面的主键都会创建
 		log.Info(fmt.Sprintf("%v ProcessingID %s %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(id), tb.destIdxSql))
-		if _, err = destDb.Exec(tb.destIdxSql); err != nil {
+		if _, err = execDest(tb.destIdxSql); err != nil {
 			log.Error("index ", tb.destIdxSql, " create index failed ", err)
 			LogError(logDir, "idxCreateFailed", tb.destIdxSql, err)
 			failedCount += 1
@@ -380,10 +556,12 @@ func (tb *Table) FKCreate(logDir string) (result []string) {
 		if err != nil {
 			log.Error(err)
 		}
+		// 外键 DDL 同样由 MySQL 侧拼装，标识符已用双引号包裹
+		createSql = applyCaseToDDL(createSql)
 		// 创建目标外键
 		if createSql != "null" {
 			log.Info(fmt.Sprintf("%v ProcessingID %s create foreign key %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(id), createSql))
-			if _, err = destDb.Exec(createSql); err != nil {
+			if _, err = execDest(createSql); err != nil {
 				log.Error(createSql, " create foreign key failed ", err)
 				LogError(logDir, "FkCreateFailed", createSql, err)
 				failedCount += 1
@@ -427,7 +605,7 @@ func (tb *Table) ViewCreate(logDir string) (result []string) {
 		tb.viewSql = "create or replace view " + viewName + " as " + transformed + ";"
 		// 创建目标视图
 		log.Info(fmt.Sprintf("%v ProcessingID %s create view %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(id), viewName))
-		if _, err = destDb.Exec(tb.viewSql); err != nil {
+		if _, err = execDest(tb.viewSql); err != nil {
 			log.Error("view ", viewName, " create view failed ", err)
 			LogError(logDir, "viewCreateFailed", tb.viewSql, err)
 			failedCount += 1
@@ -782,7 +960,7 @@ func (tb *Table) TriggerCreate(logDir string) (result []string) {
 		}
 		// 创建目标触发器
 		log.Info(fmt.Sprintf("%v ProcessingID %s create trigger %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(id), createSql))
-		if _, err = destDb.Exec(createSql); err != nil {
+		if _, err = execDest(createSql); err != nil {
 			log.Error(createSql, " create trigger failed ", err)
 			LogError(logDir, "TriggerCreateFailed", createSql, err)
 			failedCount += 1

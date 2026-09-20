@@ -1,1 +1,2 @@
 # gomysqltovastbase
+python .\php_schema_align\scan_php.py --schema D:\devsoftware\vastbases\gomysql2pg-win-x64-v0.2.7\schema.json --src D:\devsoftware\php\phpstudy_pro\WWW\bshhwyczx\trunk\public\other\newshenbaojx

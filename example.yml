@@ -15,6 +15,22 @@ maxParallel: 30
 charInLength: false
 useNvarchar2: false
 Distributed: false
+# 标识符(表名/列名)大小写，作用于建表及后续所有引用(COPY/索引/外键/序列/注释)：
+#   preserve = 保留原始大小写（默认），与 MySQL 源库一致，ORM 生成的带引号 SQL 可直接使用
+#   lower    = 全部转为小写
+#   upper    = 全部转为大写
+# 注意：保留混合大小写后，PostgreSQL 中引用该列必须加双引号且大小写完全一致，
+#      未加引号的 SELECT userName 会被折叠成 username，报 column does not exist。
+identifierCase: preserve
+# 建表时如何处理 not null 约束：
+#   time = 只放宽时间列（默认）。MySQL 非严格 SQL 模式下允许把零值日期写进
+#          not null 的时间列，而 PostgreSQL 无法表示零值日期、迁移时会把它们
+#          置为 NULL，所以这类列在目标库必须可空，否则 COPY 报 23502 非空冲突
+#   all  = 所有列都建为可空，彻底规避非空冲突（约束会丢，事后可自行加回）
+#   keep = 完全按 MySQL 的 is_nullable 原样保留，不放宽任何列
+# 说明：PostgreSQL 里可空且无 DEFAULT 的列，插入时不带该列即为 NULL，
+#      不需要额外写 DEFAULT NULL。
+notNullPolicy: time
 tables:
   test1:
     - select * from test1
