@@ -1,272 +1,317 @@
-此代码原始基础为：https://github.com/iverycd/gomysql2pg
+# gomysql2pg
 
-# 编译说明
+> 此代码原始基础为：<https://github.com/iverycd/gomysql2pg>
 
-## 环境要求
+![logo.png](image/logo.png)
 
-- Go 1.24 或更高（`go.mod` 声明 `go 1.24.0`）
-- 首次编译需联网拉取依赖，本机 GOPROXY 为 `https://goproxy.cn,direct`
+异构数据库迁移工具：**MySQL ⇄ PostgreSQL 内核数据库**双向迁移。
 
-确认环境：
-
-```bash
-go version
-go env GOPATH GOPROXY
-```
-
-## 一、最常用：编译到发布目录
-
-把源码改完后，用它替换发布目录里的可执行文件。
-
-**Git Bash**
-
-```bash
-cd /d/devsoftware/vastbases/gomysql2pg-master/gomysql2pg-master
-
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "-s -w" \
-  -o "D:/devsoftware/vastbases/gomysql2pg-win-x64-v0.2.7/gomysql2pg.exe" .
-```
-
-**PowerShell**
-
-```powershell
-cd D:\devsoftware\vastbases\gomysql2pg-master\gomysql2pg-master
-
-$env:CGO_ENABLED = "0"; $env:GOOS = "windows"; $env:GOARCH = "amd64"
-go build -ldflags "-s -w" -o D:\devsoftware\vastbases\gomysql2pg-win-x64-v0.2.7\gomysql2pg.exe .
-```
-
-> PowerShell 没有 `VAR=value cmd` 这种行内环境变量语法，必须先 `$env:VAR = "..."`。
-> 这些变量只对当前会话生效，用完可以 `Remove-Item Env:CGO_ENABLED` 清掉。
-
-参数含义：
-
-| 参数 | 作用 |
-|---|---|
-| `CGO_ENABLED=0` | 纯 Go 静态编译，不依赖系统 C 库 |
-| `GOOS` / `GOARCH` | 目标平台，交叉编译时必填 |
-| `-ldflags "-s -w"` | 去掉符号表和调试信息，二进制更小 |
-| `-o` | 输出路径，可指向任意目录 |
-| `.` | 编译当前目录（根包的 `main.go`） |
-
-## 二、普通编译（编译到当前目录）
-
-```bash
-go build -o gomysql2pg.exe .
-```
-
-## 三、编译前自检
-
-```bash
-go build ./...                      # 编译全部包
-go test -vet=off ./...              # 跑测试
-```
-
-> `-vet=off` 是必须的：`cmd/version.go:48` 和 `cmd/root.go:62` 存在两个既有的
-> vet 告警（非常量格式串、无缓冲 signal channel），会让 `go test` 在编译阶段直接失败。
-> 这两个问题与本项目功能无关，尚未修复。
-
-## 四、验证编译结果
-
-```bash
-cd D:/devsoftware/vastbases/gomysql2pg-win-x64-v0.2.7
-./gomysql2pg.exe version
-```
-
-正常输出当前版本号（如 `v0.3.1`）。
-
-## 五、编译配套工具 xlsx2yml
-
-从 Excel 批量生成 yml 配置的小工具，独立于主程序：
-
-```bash
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "-s -w" \
-  -o "D:/devsoftware/vastbases/gomysql2pg-win-x64-v0.2.7/xlsx2yml.exe" ./tools/xlsx2yml
-```
-
-## 六、全平台发布包
-
-`Makefile` 的 `release` 目标会一次性打出 MacOS / linux-arm64 / linux-x64 / win-x64 四个包：
-
-```bash
-make release VERSION=v0.3.1
-```
-
-打包内容：`gomysql2pg` 主程序、`xlsx2yml`、`example.yml`、`check_log.*`、`run_batch.*`、`configs/example.xlsx`。
-
-## 注意事项
-
-### 版本号是硬编码的，改 Makefile 传参没用
-
-`cmd/version.go:12` 里版本号写死：
-
-```go
-var ver = "v0.3.1"
-```
-
-`Makefile` 的 `build` 目标传的是 `-ldflags "-X main.Version=${VERSION}"`，但：
-
-1. 变量名叫 `ver` 不是 `Version`
-2. 变量在 `cmd` 包里不是 `main` 包
-
-两个都对不上，所以 **Go 会静默忽略这个参数**，版本号始终是源码里的值。要真正支持注入，得把 Makefile 改成：
-
-```makefile
-go build -ldflags "-X gomysql2pg/cmd.ver=${VERSION}" -o ${BINARY} .
-```
-
-或者干脆直接改 `cmd/version.go` 里的字面量。
-
-### 输出目录要和发布目录一致
-
-程序的日志目录、`configs/` 都是**相对当前工作目录**解析的，不是相对 exe 位置。所以运行时要先 `cd` 到发布目录：
-
-```bash
-cd D:/devsoftware/vastbases/gomysql2pg-win-x64-v0.2.7
-./gomysql2pg.exe --config configs/01_xxx.yml
-```
-
-### 依赖缓存位置
-
-本机 GOPATH 是 `D:\devsoftware\go\cahces`（注意目录名拼写是 `cahces`），模块缓存在其下的 `pkg/mod`。依赖拉不下来时先检查 `go env GOPROXY`。
-
-
-
-### 一、类型映射缺陷（建表报 `42601 syntax error`）
-
-#### 1. MySQL `enum` / `set` 类型未转换
-
-新增类型映射分支，统一转换为 `varchar(255)`。
-
-PostgreSQL 没有内联的 `enum` 列类型（枚举需先 `CREATE TYPE` 再引用），
-原代码的兜底分支把 `enum` 原样透传，语句无法解析。
-
-```
-修复前: "keywords" enum null
-修复后: "keywords" varchar(255) null
-```
-
-#### 2. `timestamp` / `datetime` 默认值未加引号
-
-新增 `quoteDefault()`，按列类型决定默认值是否需要单引号包裹。
-
-MySQL 的 `information_schema.COLUMNS.column_default` 返回的是**裸值**，原代码
-只对 `varchar` / `char` 补引号，时间类型直接输出：
-
-```sql
--- PG 把 1990-02-02 11:00:00 当算术表达式解析（1990-02-02 = 1986），
--- 再撞上 "11" 报 syntax error at or near "11"
-"createtime" timestamp not null default 1990-02-02 11:00:00
-```
-
-```
-修复后: "createtime" timestamp not null default '1990-02-02 11:00:00'
-```
-
-表达式类默认值（`CURRENT_TIMESTAMP` 及其精度变体、`CURRENT_DATE`、
-`CURRENT_TIME`、`LOCALTIME`、`LOCALTIMESTAMP`、`NULL`、`TRUE`、`FALSE`）
-走白名单原样输出，否则会被引号包裹而退化成字符串字面量。
-
-值内的单引号按 SQL 标准双写转义（`O'Brien` → `'O''Brien'`）。
-
-#### 3. `enum` 默认值未加引号
-
-同由 `quoteDefault()` 处理。MySQL 把 enum 默认值存成裸标识符：
-
-```
-修复前: "status" enum not null default Y
-修复后: "status" varchar(255) not null default 'Y'
-```
-
-`temporary`、`auto`、`评审专家` 等取值同理，其中 `temporary` 还是 PG 保留字。
+支持的目标/源数据库：`PostgreSQL`、`海量数据库 Vastbase`、`华为 GaussDB`、
+`电信 TelePG`、`人大金仓 Kingbase V8R6`、`华高数据库 HighGo` 等。
 
 ---
 
-### 二、MySQL 零值日期（数据迁移报 `22007` / `23502`）
+## 目录
 
-MySQL 允许 `0000-00-00 00:00:00`，PostgreSQL 无法表示年/月/日为 0 的时间值。
-分三层处理：
-
-#### 4. 列默认值是零值日期 → 建表失败
-
-新增 `isZeroDatetime()`，命中则丢弃该默认值。
-
-```
-修复前: "created" timestamp null default 0000-00-00 00:00:00
-修复后: "created" timestamp null
-```
-
-#### 5. 行数据是零值日期 → COPY 报 `invalid input syntax for type timestamp`
-
-在 `runMigration` 的列值转换中接入 `isZeroDatetime()`，命中则置为 `NULL`，
-与建表时的处理保持一致。
-
-该函数会对每行的每列调用，因此先用 `0000-` 前缀做廉价短路，仅命中时才执行
-`strings.ToLower`，避免逐行产生字符串分配。
-
-#### 6. 置 NULL 后撞上 `not null` 约束 → 报 `23502`
-
-新增 `isTimeType()`，**目标库的时间类型列（`timestamp` / `datetime` /
-`date` / `time`）一律建为可空**。
-
-> **注意**：此处曾有过一次修正。最初的做法是用「该列的默认值是不是零值日期」
-> 来推断它会不会存零值日期，该代理指标不成立——MySQL 在非严格 SQL 模式下
-> 允许把非法日期写进 `not null` 的时间列，所以这类列声明的 `not null`
-> **整体不可信**，与默认值无关。例如 `sys_user.applytime` 的默认值是合法的
-> `1990-02-02 11:00:00`，但列内仍存在零值日期。现改为整体放宽。
+- [核心特性](#核心特性)
+- [快速开始](#快速开始)
+- [命令一览](#命令一览)
+- [配置说明](#配置说明)
+- [反向迁移：PG / Vastbase → MySQL](#反向迁移pg--vastbase--mysql)
+- [配套工具](#配套工具)
+- [文档索引](#文档索引)
+- [常见问题](#常见问题)
 
 ---
 
-### 三、日志可观测性
+## 核心特性
 
-#### 7. `failedTable.log` 缺少失败原因
+**开箱即用** —— 解压即可运行，单文件二进制，支持 Windows / Linux / macOS。
 
-新增 `errSummary()`，写入 `SQLSTATE 错误码 + 错误消息` 摘要。
+**并发迁移** —— 多个 goroutine 并行处理，充分利用多核；支持一次迁移上百对数据库。
 
-lib/pq 的 `Error.Error()` 只返回 Message，摘要额外带上错误码便于归类排查：
+**覆盖对象完整** —— 表结构、视图、索引、外键、自增列、注释、行数据。
 
-```
-修复后:
-test_xingshen -- 23502 null value in column "opttime_content2" violates not-null constraint
-sys_user -- 23502 null value in column "applytime" violates not-null constraint
-```
-
-常见错误码对照：
-
-| 错误码 | 含义 |
-|---|---|
-| `23502` | 非空约束冲突 |
-| `23503` | 外键约束冲突 |
-| `22007` | 日期格式非法 |
-| `22001` | 值超长 |
-| `22021` | 非法 UTF-8 字节序列 |
-| `42601` | 语法错误 |
-
----
-
-### 变更文件
-
-| 文件 | 说明 |
-|---|---|
-| `cmd/tablemeta.go` | 建表逻辑：类型映射、默认值、可空性 |
-| `cmd/root.go` | 数据迁移逻辑、日志摘要 |
-| `cmd/tablemeta_test.go` | 新增，71 个用例 |
-| `cmd/root_test.go` | 新增，6 个用例 |
-| `BUILD.md` | 新增，编译说明 |
-
-### 新增函数
-
-| 函数 | 位置 | 职责 |
+| 方向 | 命令 | 状态 |
 |---|---|---|
-| `isTimeType` | `cmd/tablemeta.go` | 时间类型判定，大小写不敏感 |
-| `isZeroDatetime` | `cmd/tablemeta.go` | 零值日期判定，带前缀短路 |
-| `quoteDefault` | `cmd/tablemeta.go` | 默认值引号与转义 |
-| `errSummary` | `cmd/root.go` | 迁移错误单行摘要 |
+| MySQL → PG 内核库 | 默认命令 | 成熟 |
+| PG 内核库 → MySQL | `pg2mysql` | 新增，见[下方说明](#反向迁移pg--vastbase--mysql) |
 
+**为什么需要专用工具** —— MySQL 与 PG 内核数据库在表结构、列类型、自增列实现、
+函数、存储过程等方面差异很大。用 SQL 备份文件导入是效率最低、最不可取的方式。
+本工具从数据字典读取对象定义并适配到目标库，把人工成本降到最低。
 
-#### 运行注意事项
+**过程可追溯** —— 失败的对象按类型分开记录日志（建表失败、索引失败、需人工处理、
+信息损失告警），不静默跳过。
 
-- **重跑是全量 `DROP TABLE ... CASCADE` + 重建 + 全量 COPY**，没有增量逻辑。
-  目标库若已有新数据写入，重跑会清除。
-- 只想补跑部分表时，用 `exclude` 排除已成功的表；**不要用 `-s`**，
-  该模式会跳过序列 / 索引 / 外键 / 视图 / 触发器的创建。
+---
+
+## 快速开始
+
+### 1. 准备配置文件
+
+```yaml
+src:                      # 源库（MySQL）
+  host: 192.168.1.3
+  port: 3306
+  database: test
+  username: root
+  password: 11111
+
+dest:                     # 目标库（PG 内核库）
+  dbType: Gauss           # Gauss / HighGo，不填则按标准 PostgreSQL
+  host: 192.168.1.200
+  port: 5432
+  database: test
+  username: test
+  password: 11111
+
+pageSize: 100000          # 分页大小，仅全库迁移时生效
+maxParallel: 30           # 并发协程数
+charInLength: false       # varchar 是否使用「字符长度」语义
+useNvarchar2: false       # 是否统一使用 nvarchar2（GaussDB 支持）
+Distributed: false        # 分布式库是否按主键设置分布列
+identifierCase: preserve  # 标识符大小写：preserve / lower / upper
+notNullPolicy: time       # not null 放宽策略：time / all / keep
+```
+
+完整说明见[配置说明](#配置说明)。
+
+### 2. 运行
+
+```bash
+# 全库迁移
+./gomysql2pg --config example.yml
+
+# 只迁移 yml 中 tables: 指定的表
+./gomysql2pg --config example.yml -s
+```
+
+### 3. 查看结果
+
+迁移结束打印摘要表：
+
+```
+Object      BeginTime              EndTime                FailedTotal  ElapsedTime
+Table       ...                    ...                    0            2.3s
+TableData   ...                    ...                    0            1h12m
+Index       ...                    ...                    0            8.4s
+```
+
+日志目录下按失败类型分开记录：
+
+| 文件 | 含义 |
+|---|---|
+| `tableCreateFailed.log` | 建表失败 |
+| `idxCreateFailed.log` / `FkCreateFailed.log` | 索引 / 外键失败 |
+| `viewCreateFailed.log` / `TriggerCreateFailed.log` | 视图 / 触发器失败 |
+| `failedTable.log` | 数据迁移失败的表 + 错误摘要 |
+| `errorTableData.log` | 失败行的具体数据 |
+| `commentFailed.log` | 注释同步失败 |
+| `invalidTableData.log` | 数据被清洗（警告级） |
+
+批量迁移后用 `check_log.sh` / `check_log.ps1` 一键扫描：
+
+```bash
+bash check_log.sh              # 列出所有含失败日志的批次
+```
+
+---
+
+## 命令一览
+
+| 命令 | 用途 |
+|---|---|
+| *（默认）* | 全流程迁移：建表 → 灌数据 → 索引 → 外键 → 视图 → 触发器 |
+| `createTable` | 只建表结构 |
+| `seqOnly` / `idxOnly` / `viewOnly` | 只建序列 / 索引 / 视图 |
+| `onlyData` | 只迁移数据行 |
+| `dryRun` | 只读预检：连通性 + 目标 schema 检查，不创建任何对象 |
+| `compareDb` | 逐表比对源库与目标库行数 |
+| `dumpSchema` | 导出目标库字段清单（JSON），供应用代码适配使用 |
+| `pg2mysql` | **反向迁移**：PG 内核库 → MySQL |
+| `version` | 打印版本号 |
+
+常用全局参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--config <path>` | 配置文件路径，默认 `$HOME/.gomysql2pg.yaml` |
+| `-s, --selFromYml` | 只迁移 yml 中 `tables:` 列出的表和 SQL |
+| `-t, --tableOnly` | 配合 `createTable` 使用，只建结构不导数据 |
+
+---
+
+## 配置说明
+
+### 连接
+
+| 配置项 | 说明 |
+|---|---|
+| `src.*` | MySQL 侧：`host` / `port` / `database` / `username` / `password` |
+| `dest.*` | PG 侧：同上，外加 `dbType` |
+| `dest.dbType` | `Gauss` → openGauss 驱动；`HighGo` → HighGo 驱动；留空 → 标准 PostgreSQL |
+
+### 迁移行为
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `pageSize` | 100000 | 分页大小。越大越省内存，但单页失败重试代价越高 |
+| `maxParallel` | 20 | 并发协程数，同时决定目标库连接池上限 |
+| `exclude` | — | 排除的表名，支持 `*` 通配 |
+| `tables` | — | 配合 `-s` 使用：指定表名与查询 SQL |
+
+### 类型映射
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `charInLength` | false | 生成 `varchar(100 char)` 而非 `varchar(100)` |
+| `useNvarchar2` | false | 统一用 `nvarchar2`，按字符而非字节计长 |
+| `Distributed` | false | 分布式库按主键设置分布列 |
+
+### 标识符与约束
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `identifierCase` | `preserve` | `preserve` 保留原始大小写；`lower` / `upper` 统一转换 |
+| `notNullPolicy` | `time` | `time` 只放宽时间列；`all` 全部可空；`keep` 完全照搬源库 |
+
+> **`identifierCase` 怎么选**：看应用代码怎么写 SQL。
+> 未加引号的标识符在 PG 里会折叠成小写——代码里大量裸写列名就选 `lower`，
+> 用 ORM 生成带引号 SQL 就选 `preserve`。**选对了应用代码可能一行都不用改。**
+
+### 视图
+
+| 配置项 | 说明 |
+|---|---|
+| `schemaMapping` | 视图定义中跨 schema 引用的映射：`源schema: 目标schema`，值为空串表示删除该前缀 |
+
+---
+
+## 反向迁移：PG / Vastbase → MySQL
+
+```bash
+gomysql2pg --config example.yml pg2mysql
+gomysql2pg --config example.yml pg2mysql --batch 1000 --row-format COMPACT
+```
+
+**配置沿用同一份 yml，方向相反**：
+
+| 配置段 | 正向迁移 | `pg2mysql` |
+|---|---|---|
+| `src:` | MySQL 源库 | **MySQL 目标库** |
+| `dest:` | PG 目标库 | **PG 源库** |
+
+### 迁移顺序
+
+```
+建表 → 灌数据 → 建索引 → 建外键 → 建视图
+```
+
+索引和外键放在数据之后——边灌边维护索引会慢一个数量级，外键也能避免表间顺序问题。
+
+### 能力边界
+
+| 能自动迁移 | 只报告、不自动迁移 |
+|---|---|
+| 表结构（列 / 类型 / 可空性 / 默认值 / 注释 / 主键） | 触发器 —— PG 绑定函数，MySQL 内联体，模型不同 |
+| 数据行（批量 INSERT） | 分区表 / 继承子表 —— 建表方式完全不同 |
+| btree 索引、唯一索引 | 表达式索引 / 部分索引 / gin·gist —— MySQL 无对应物 |
+| 外键约束 | 数组类型 —— MySQL 装不下 |
+| 视图（转换标识符引号） | |
+| 自增列（序列 → `AUTO_INCREMENT`） | |
+
+无法迁移的对象写入日志目录的 `pg2mysqlManual.log`，**不会静默跳过**。
+
+### 已知限制
+
+**命名冲突会中止迁移** —— PG 标识符大小写敏感（`"Name"` 和 `"name"` 是两个列），
+MySQL 列名不区分大小写，两者无法共存。程序在建表前拦下并列出冲突项。
+
+**类型装不下就报错，不降级** —— 数组等类型会让整张表建不出来，
+而不是猜一个类型糊过去。静默降级会丢结构信息，事后极难发现。
+
+---
+
+## 配套工具
+
+### PHP 代码字段对齐 `tools/php_schema_align/`
+
+数据库迁移后，应用代码里引用的列名可能需要跟着改。三个 Python 脚本覆盖全过程：
+
+| 脚本 | 用途 |
+|---|---|
+| `mysql_case_fields.py` | 迁移前：查源库有哪些字段是混合大小写 |
+| `scan_php.py` | 分析代码里引用了哪些列，分类批量改写 |
+| `replace_fields.py` | 按清单逐字段 / 逐处确认后替换 |
+
+```bash
+pip install pymysql                      # 仅 mysql_case_fields.py 需要
+
+python tools/php_schema_align/mysql_case_fields.py --config example.yml
+python tools/php_schema_align/scan_php.py --schema schema.json \
+  --src /path/to/php --dirs models,controllers
+python tools/php_schema_align/replace_fields.py \
+  --fields mysql_case_fields.txt --src /path/to/php --dry-run
+```
+
+覆盖的引用写法：SQL 语句、PHP 数组键、函数字符串参数、Smarty 模板属性。
+会识别并保护不该改的部分：表单字段名、会话数据、注释、正则字面量。
+
+详见 [tools/php_schema_align/README.md](tools/php_schema_align/README.md)。
+
+### Excel 转配置 `tools/xlsx2yml/`
+
+从 Excel 批量生成迁移配置文件。
+
+```bash
+go run ./tools/xlsx2yml -f configs/example.xlsx -o configs
+```
+
+---
+
+## 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [readme_cn.md](readme_cn.md) | 详细使用指南：单库 / 多库批量迁移完整流程 |
+| [BUILD.md](BUILD.md) | 编译说明：各平台构建命令、注意事项 |
+| [CHANGELOG.md](CHANGELOG.md) | 变更记录：每项修复的问题、取舍与踩过的坑 |
+| [tools/php_schema_align/README.md](tools/php_schema_align/README.md) | PHP 代码字段对齐工具 |
+
+---
+
+## 常见问题
+
+**Q：迁移后应用读不到数据 / 列名对不上**
+
+先确认 `identifierCase` 选对了。PG 里未加引号的标识符会折叠成小写，
+若目标列是混合大小写而代码裸写列名，就会找不到列。
+用 `dumpSchema` 导出目标库真实列名，配合 PHP 对齐工具排查。
+
+**Q：建表报 `syntax error at or near "null"`**
+
+源库使用了 PostgreSQL 没有的类型（如 MySQL 的 `enum`）或未经转换的默认值。
+查看 `tableCreateFailed.log` 里的完整语句。若确认是类型映射遗漏，欢迎提 Issue。
+
+**Q：数据迁移报 `invalid input syntax for type timestamp`**
+
+源库存在零值日期（`0000-00-00`）。MySQL 允许，PostgreSQL 不允许——
+工具会自动转为 `NULL`，若仍有残留请看 `errorTableData.log`。
+
+**Q：重跑会重复迁移吗**
+
+会，而且是**全量重建**：每张表都会 `DROP TABLE ... CASCADE` 后重建再灌数据。
+**目标库若已有新数据写入，重跑会清除。** 只想补跑部分表时用 `exclude` 排除已成功的表——
+不要用 `-s`，该模式会跳过索引、外键、视图、触发器的创建。
+
+**Q：反向迁移后索引少了几个**
+
+看 `pg2mysqlManual.log`。表达式索引、部分索引、gin/gist 索引 MySQL 没有对应物，
+会明确列出。静默少建索引会让查询在迁移后突然变慢，且极难定位。
+
+---
+
+## 许可
+
+见 [LICENSE](LICENSE)。
