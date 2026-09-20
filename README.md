@@ -2,8 +2,6 @@
 
 > 此代码原始基础为：<https://github.com/iverycd/gomysql2pg>
 
-![logo.png](image/logo.png)
-
 异构数据库迁移工具：**MySQL ⇄ PostgreSQL 内核数据库**双向迁移。
 
 支持的目标/源数据库：`PostgreSQL`、`海量数据库 Vastbase`、`华为 GaussDB`、
@@ -235,7 +233,7 @@ MySQL 列名不区分大小写，两者无法共存。程序在建表前拦下�
 
 ## 配套工具
 
-### PHP 代码字段对齐 `tools/php_schema_align/`
+### PHP 代码字段对齐 `pythons/`
 
 数据库迁移后，应用代码里引用的列名可能需要跟着改。三个 Python 脚本覆盖全过程：
 
@@ -248,17 +246,17 @@ MySQL 列名不区分大小写，两者无法共存。程序在建表前拦下�
 ```bash
 pip install pymysql                      # 仅 mysql_case_fields.py 需要
 
-python tools/php_schema_align/mysql_case_fields.py --config example.yml
-python tools/php_schema_align/scan_php.py --schema schema.json \
+python pythons/mysql_case_fields.py --config example.yml
+python pythons/scan_php.py --schema schema.json \
   --src /path/to/php --dirs models,controllers
-python tools/php_schema_align/replace_fields.py \
+python pythons/replace_fields.py \
   --fields mysql_case_fields.txt --src /path/to/php --dry-run
 ```
 
 覆盖的引用写法：SQL 语句、PHP 数组键、函数字符串参数、Smarty 模板属性。
 会识别并保护不该改的部分：表单字段名、会话数据、注释、正则字面量。
 
-详见 [tools/php_schema_align/README.md](tools/php_schema_align/README.md)。
+详见 [pythons/README.md](pythons/README.md)。
 
 ### Excel 转配置 `tools/xlsx2yml/`
 
@@ -277,7 +275,7 @@ go run ./tools/xlsx2yml -f configs/example.xlsx -o configs
 | [readme_cn.md](readme_cn.md) | 详细使用指南：单库 / 多库批量迁移完整流程 |
 | [BUILD.md](BUILD.md) | 编译说明：各平台构建命令、注意事项 |
 | [CHANGELOG.md](CHANGELOG.md) | 变更记录：每项修复的问题、取舍与踩过的坑 |
-| [tools/php_schema_align/README.md](tools/php_schema_align/README.md) | PHP 代码字段对齐工具 |
+| [pythons/README.md](pythons/README.md) | PHP 代码字段对齐工具 |
 
 ---
 
