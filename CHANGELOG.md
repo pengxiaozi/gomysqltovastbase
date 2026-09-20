@@ -458,10 +458,64 @@ notNullPolicy: time   # time(默认) | all | keep
 > 的列，插入时不带该列即为 `NULL`，`DEFAULT NULL` 是冗余写法，因此这里只输出
 > 列级约束（`null` / `not null`），不额外拼 `DEFAULT NULL`。
 
+### 十、反向迁移：PG / Vastbase → MySQL
+
+#### 23. 新增 `pg2mysql` 子命令
+
+```bash
+gomysql2pg --config example.yml pg2mysql
+gomysql2pg --config example.yml pg2mysql --batch 1000 --row-format COMPACT
+```
+
+配置沿用同一份 yml，**方向相反**：
+
+| 配置段 | 正向迁移（默认命令） | 反向迁移（pg2mysql） |
+|---|---|---|
+| `src:` | MySQL 源库 | **MySQL 目标库** |
+| `dest:` | PG 目标库 | **PG 源库**（PostgreSQL / Vastbase / GaussDB / HighGo） |
+
+**为什么不是"加个 --reverse 参数"**：正向流程的六层都与方向绑死——
+元数据查询用 MySQL 专有函数、类型映射单向、DDL 生成塞在 MySQL 的
+`concat()` 里、数据搬运靠 PG 的 COPY 协议。所以这是一套独立实现，
+只复用连接/日志/并发骨架与 PG 元数据读取范式。
+
+**迁移顺序**：建表 → 灌数据 → 建索引 → 建外键 → 建视图。
+索引和外键放在数据之后——边灌边维护索引会慢一个数量级，
+外键也能避免表间先后顺序导致的失败。
+
+| 能自动迁移 | 只报告、不自动迁移 |
+|---|---|
+| 列 / 类型映射 / 可空性 / 默认值 / 注释 / 主键 | 触发器（PG 绑定函数 vs MySQL 内联体，模型不同） |
+| 数据行（批量 INSERT） | 分区表 / 继承子表（建表方式完全不同） |
+| btree 索引、唯一索引 | 表达式索引 / 部分索引 / gin·gist（MySQL 无对应物） |
+| 外键约束 | 数组类型（MySQL 装不下） |
+| 视图（仅转换标识符引号） | |
+| 自增列（序列 → `AUTO_INCREMENT`） | |
+
+**自动化的边界**：PG 标识符大小写敏感，MySQL 列名不区分大小写，
+因此源库若同时存在只差大小写的列名或表名，**MySQL 装不下**——
+程序在建表前拦下并列出冲突项，而不是静默丢列。
+
+**几个刻意的取舍**：
+
+- MySQL 装不下的类型（数组）**直接报错让整张表建不出来**，不降级猜类型
+- `nextval(...)` 默认值不再当默认值写，改判为自增列；
+  **非主键的自增列会降级并告警**——MySQL 要求自增列必须是键
+- 带 `::` 类型转换、或转不了的默认值一律丢弃并记入 `pg2mysqlWarnings.log`
+  ——保留一个错误的默认值比没有它更危险
+- 表达式索引、部分索引、gin/gist/hash 索引**明确跳过并给出原因**，
+  静默少建一个索引会让查询在迁移后突然变慢，且极难定位
+- 触发器与分区表**完全不尝试改写**，只列出名字写进 `pg2mysqlManual.log`
+
+新增 `cmd/pgmeta.go`（PG 元数据读取 + 类型映射 + DDL 生成）、
+`cmd/pg2mysql.go`（子命令与数据搬迁）、`cmd/pgmeta_test.go`（43 个用例）。
+
 ### 变更文件
 
 | 文件 | 说明 |
 |---|---|
+| `cmd/pgmeta.go` | 新增，PG 元数据读取、PG→MySQL 类型映射、DDL 生成 |
+| `cmd/pg2mysql.go` | 新增，反向迁移子命令与数据搬迁 |
 | `cmd/dumpschema.go` | 新增，字段清单导出子命令 |
 | `tools/php_schema_align/` | 新增，PHP 代码对齐扫描/改写工具 |
 | `cmd/tablemeta.go` | 建表逻辑：类型映射、默认值、可空性、标识符引用、注释同步、大小写配置 |
